@@ -16,17 +16,40 @@ limitations under the License.
 
 package util
 
-const (
-	GiB = 1024 * 1024 * 1024
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+
+	"k8s.io/klog/v2"
 )
 
-// RoundUpBytes rounds up the volume size in bytes upto multiplications of GiB
+const (
+	GiB                  = 1024 * 1024 * 1024
+	MaxPathLengthWindows = 260
+)
+
+type AzcopyJobState string
+
+const (
+	AzcopyJobError                         AzcopyJobState = "Error"
+	AzcopyJobNotFound                      AzcopyJobState = "NotFound"
+	AzcopyJobRunning                       AzcopyJobState = "Running"
+	AzcopyJobCompleted                     AzcopyJobState = "Completed"
+	AzcopyJobCompletedWithErrors           AzcopyJobState = "CompletedWithErrors"
+	AzcopyJobCompletedWithSkipped          AzcopyJobState = "CompletedWithSkipped"
+	AzcopyJobCompletedWithErrorsAndSkipped AzcopyJobState = "CompletedWithErrorsAndSkipped"
+)
+
+// RoundUpBytes rounds up the volume size in bytes up to multiplications of GiB
 // in the unit of Bytes
 func RoundUpBytes(volumeSizeBytes int64) int64 {
 	return roundUpSize(volumeSizeBytes, GiB) * GiB
 }
 
-// RoundUpGiB rounds up the volume size in bytes upto multiplications of GiB
+// RoundUpGiB rounds up the volume size in bytes up to multiplications of GiB
 // in the unit of GiB
 func RoundUpGiB(volumeSizeBytes int64) int64 {
 	return roundUpSize(volumeSizeBytes, GiB)
@@ -53,4 +76,162 @@ func roundUpSize(volumeSizeBytes int64, allocationUnitBytes int64) int64 {
 		roundedUp++
 	}
 	return roundedUp
+}
+
+type EXEC interface {
+	RunCommand(string, []string) (string, error)
+}
+
+type ExecCommand struct{}
+
+func (ec *ExecCommand) RunCommand(cmdStr string, authEnv []string) (string, error) {
+	cmd := exec.Command("sh", "-c", cmdStr)
+	if len(authEnv) > 0 {
+		cmd.Env = append(os.Environ(), authEnv...)
+	}
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+type Azcopy struct {
+	ExecCmd EXEC
+}
+
+// GetAzcopyJob get the azcopy job status if job existed
+func (ac *Azcopy) GetAzcopyJob(dstFileshare string, authAzcopyEnv []string) (AzcopyJobState, string, error) {
+	cmdStr := fmt.Sprintf("azcopy jobs list | grep %s -B 3", dstFileshare)
+	// cmd output example:
+	// JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9
+	// Start Time: Monday, 07-Aug-23 03:29:54 UTC
+	// Status: Completed (or Cancelled, InProgress)
+	// Command: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false
+	// --
+	// JobId: b598cce3-9aa9-9640-7793-c2bf3c385a9a
+	// Start Time: Wednesday, 09-Aug-23 09:09:03 UTC
+	// Status: Cancelled
+	// Command: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false
+	out, err := ac.ExecCmd.RunCommand(cmdStr, authAzcopyEnv)
+	// if grep command returns nothing, the exec will return exit status 1 error, so filter this error
+	if err != nil && err.Error() != "exit status 1" {
+		klog.Warningf("failed to get azcopy job with error: %v, jobState: %v", err, AzcopyJobError)
+		return AzcopyJobError, "", fmt.Errorf("couldn't list jobs in azcopy %v", err)
+	}
+	jobid, jobState, err := parseAzcopyJobList(out)
+	if err != nil || jobState == AzcopyJobError {
+		klog.Warningf("failed to get azcopy job with error: %v, jobState: %v", err, jobState)
+		return AzcopyJobError, "", fmt.Errorf("couldn't parse azcopy job list in azcopy %v", err)
+	}
+	if jobState == AzcopyJobCompleted || jobState == AzcopyJobCompletedWithErrors || jobState == AzcopyJobCompletedWithSkipped || jobState == AzcopyJobCompletedWithErrorsAndSkipped {
+		return jobState, "100.0", err
+	}
+	if jobid == "" {
+		return jobState, "", err
+	}
+	cmdPercentStr := fmt.Sprintf("azcopy jobs show %s | grep Percent", jobid)
+	// cmd out example:
+	// Percent Complete (approx): 100.0
+	summary, err := ac.ExecCmd.RunCommand(cmdPercentStr, authAzcopyEnv)
+	if err != nil {
+		klog.Warningf("failed to get azcopy job with error: %v, jobState: %v", err, AzcopyJobError)
+		return AzcopyJobError, "", fmt.Errorf("couldn't show jobs summary in azcopy %v", err)
+	}
+	jobState, percent, err := parseAzcopyJobShow(summary)
+	if err != nil || jobState == AzcopyJobError {
+		klog.Warningf("failed to get azcopy job with error: %v, jobState: %v", err, jobState)
+		return AzcopyJobError, "", fmt.Errorf("couldn't parse azcopy job show in azcopy %v", err)
+	}
+	return jobState, percent, nil
+}
+
+func (ac *Azcopy) CleanJobs() (string, error) {
+	return ac.ExecCmd.RunCommand("azcopy jobs clean", nil)
+}
+
+// parseAzcopyJobList parse command azcopy jobs list, get jobid and state from joblist
+func parseAzcopyJobList(joblist string) (string, AzcopyJobState, error) {
+	jobid := ""
+	jobSegments := strings.Split(joblist, "JobId: ")
+	if len(jobSegments) < 2 {
+		return jobid, AzcopyJobNotFound, nil
+	}
+	jobSegments = jobSegments[1:]
+	for _, job := range jobSegments {
+		segments := strings.Split(job, "\n")
+		if len(segments) < 4 {
+			return jobid, AzcopyJobError, fmt.Errorf("error parsing jobs list: %s", job)
+		}
+		statusSegments := strings.Split(segments[2], ": ")
+		if len(statusSegments) < 2 {
+			return jobid, AzcopyJobError, fmt.Errorf("error parsing jobs list status: %s", segments[2])
+		}
+		status := statusSegments[1]
+		switch status {
+		case "InProgress":
+			jobid = segments[0]
+		case "Completed":
+			return jobid, AzcopyJobCompleted, nil
+		case "CompletedWithErrors":
+			return jobid, AzcopyJobCompletedWithErrors, nil
+		case "CompletedWithSkipped":
+			return jobid, AzcopyJobCompletedWithSkipped, nil
+		case "CompletedWithErrorsAndSkipped":
+			return jobid, AzcopyJobCompletedWithErrorsAndSkipped, nil
+		}
+	}
+	if jobid == "" {
+		return jobid, AzcopyJobNotFound, nil
+	}
+	return jobid, AzcopyJobRunning, nil
+}
+
+// parseAzcopyJobShow parse command azcopy jobs show jobid, get job state and copy percent
+func parseAzcopyJobShow(jobshow string) (AzcopyJobState, string, error) {
+	segments := strings.Split(jobshow, ": ")
+	if len(segments) < 2 {
+		return AzcopyJobError, "", fmt.Errorf("error parsing jobs summary: %s in Percent Complete (approx)", jobshow)
+	}
+	return AzcopyJobRunning, strings.ReplaceAll(segments[1], "\n", ""), nil
+}
+
+// ExecFunc returns a exec function's output and error
+type ExecFunc func() (err error)
+
+// TimeoutFunc returns output and error if an ExecFunc timeout
+type TimeoutFunc func() (err error)
+
+// WaitUntilTimeout waits for the exec function to complete or return timeout error
+func WaitUntilTimeout(timeout time.Duration, execFunc ExecFunc, timeoutFunc TimeoutFunc) error {
+	// Create a channel to receive the result of the azcopy exec function
+	done := make(chan bool, 1)
+	var err error
+
+	// Start exec function in a goroutine
+	go func() {
+		err = execFunc()
+		done <- true
+	}()
+
+	// Wait for the function to complete or time out
+	select {
+	case <-done:
+		return err
+	case <-time.After(timeout):
+		return timeoutFunc()
+	}
+}
+
+// GenerateVolumeName returns a PV name with clusterName prefix. The function
+// should be used to generate a name of GCE PD or Cinder volume. It basically
+// adds "<clusterName>-dynamic-" before the PV name, making sure the resulting
+// string fits given length and cuts "dynamic" if not.
+func GenerateVolumeName(clusterName, pvName string, maxLength int) string {
+	prefix := clusterName + "-dynamic"
+	pvLen := len(pvName)
+
+	// cut the "<clusterName>-dynamic" to fit full pvName into maxLength
+	// +1 for the '-' dash
+	if pvLen+1+len(prefix) > maxLength {
+		prefix = prefix[:maxLength-pvLen-1]
+	}
+	return prefix + "-" + pvName
 }

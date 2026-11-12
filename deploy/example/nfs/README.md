@@ -1,28 +1,18 @@
 ## NFS support
-[NFS 4.1 support for Azure Files](https://azure.microsoft.com/en-us/blog/nfs-41-support-for-azure-files-is-now-in-preview/preview/) is now in Public Preview. This service is optimized for random access workloads with in-place data updates and provides full POSIX file system support. This page shows how to use NFS feature by Azure File CSI driver on Azure Kubernetes cluster.
-
+[NFS 4.1 support for Azure Files](https://docs.microsoft.com/en-us/azure/storage/files/files-nfs-protocol) is optimized for random access workloads with in-place data updates and provides full POSIX file system support. This page shows how to use NFS feature by Azure File CSI driver on Azure Kubernetes cluster.
+- [Compare access to Azure Files, Blob Storage, and Azure NetApp Files with NFS](https://docs.microsoft.com/en-us/azure/storage/common/nfs-comparison)
+- [Encrypt in Transit(EiT) for NFS](https://learn.microsoft.com/en-us/azure/storage/files/encryption-in-transit-for-nfs-shares) is now supported from CSI driver v1.33.0, by setting `encryptInTransit: "true"` in the `parameters` of storage class or persistent volume, you can enable data encryption in transit for NFS Azure file volumes. Server-side account-level enforcement (`ProtocolSettings.Nfs.EncryptionInTransit.Required=true`) is configured only when the driver creates a new storage account; the driver does not update this property on an existing/reused account.
+  - Currently, Encrypt in Transit (EiT) feature is not supported on Ubuntu 20.04.
 - supported OS: Linux
 
-#### Supported CSI driver version: `v0.9.0`
-> storage account dynamic provisioning is supported from `v0.10.0`.
-
-#### [Available regions](https://aka.ms/azurefiles/nfs/preview/regions)
-We are continually adding more regions. Latest region list is available on [Azure NFS documentation](https://aka.ms/azurefiles/nfs/preview/regions)
-
 #### Prerequisite
- - [Install CSI driver](https://github.com/kubernetes-sigs/azurefile-csi-driver/blob/master/docs/install-csi-driver-master.md)
- - Register `AllowNfsFileShares` feature under your subscription
-```console
-az feature register --name AllowNfsFileShares --namespace Microsoft.Storage
-az feature list -o table --query "[?contains(name, 'Microsoft.Storage/AllowNfsFileShares')].{Name:name,State:properties.state}"
-az provider register --namespace Microsoft.Storage
-```
- - [Optional] Create a `Premium_LRS` Azure storage account with following configurations to support NFS share
+ - When using AKS managed CSI driver, make sure cluster `Control plane` identity(with name `AKS Cluster Name`) has `Contributor` permission on vnet resource group
+ - [Optional] Create a `Premium_LRS` or `Premium_ZRS` Azure storage account with following configurations to support NFS share
+   > `Premium_ZRS` account type is only supported in [limited region support](https://docs.microsoft.com/en-us/azure/storage/common/storage-redundancy#zone-redundant-storage)
    - account kind: `FileStorage`
-   - secure transfer required(enable HTTPS traffic only): `false`
+   - Set `Require secure transfer for REST API operations(enable HTTPS traffic only)` as `false` when Encrypt in Transit(EiT) feature is not enabled
    - select virtual network of agent nodes in `Firewalls and virtual networks`
    - specify `storageAccount` in below storage class `parameters`
- - [Optional] If cluster identity is Managed Service Identity(MSI), make sure user assigned identity has `Contributor` role on node resource group
 
 #### How to use NFS feature
  - Create an Azure File storage class
@@ -36,6 +26,14 @@ metadata:
 provisioner: file.csi.azure.com
 parameters:
   protocol: nfs
+  skuName: Premium_LRS  # available values: Premium_LRS, Premium_ZRS
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+mountOptions:
+  - nconnect=4
+  - noresvport
+  - actimeo=30
 ```
 
 run following commands to create a storage class:
@@ -71,4 +69,6 @@ helm install --set persistence.storageClass="azurefile-csi-nfs" --set persistenc
 ```
 
 #### Links
+ - [Azure File NFS mount options on Linux](https://learn.microsoft.com/en-us/azure/storage/files/storage-files-how-to-mount-nfs-shares#mount-options)
  - [Troubleshoot Azure NFS file shares](https://docs.microsoft.com/en-us/azure/storage/files/storage-troubleshooting-files-nfs)
+ - [Mount NFS Azure file share on Linux limitations](https://learn.microsoft.com/en-us/azure/storage/files/storage-files-how-to-mount-nfs-shares#limitations)

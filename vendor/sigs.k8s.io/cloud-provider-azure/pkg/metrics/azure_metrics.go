@@ -24,7 +24,7 @@ import (
 	"k8s.io/component-base/metrics/legacyregistry"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
-	"sigs.k8s.io/cloud-provider-azure/pkg/retry"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 )
 
 var (
@@ -59,6 +59,8 @@ type operationCallMetrics struct {
 type MetricContext struct {
 	start      time.Time
 	attributes []string
+	// log level in ObserveOperationWithResult
+	LogLevel int32
 }
 
 // NewMetricContext creates a new MetricContext.
@@ -66,6 +68,7 @@ func NewMetricContext(prefix, request, resourceGroup, subscriptionID, source str
 	return &MetricContext{
 		start:      time.Now(),
 		attributes: []string{prefix + "_" + request, strings.ToLower(resourceGroup), subscriptionID, source},
+		LogLevel:   3,
 	}
 }
 
@@ -79,24 +82,28 @@ func (mc *MetricContext) ThrottledCount() {
 	apiMetrics.throttledCount.WithLabelValues(mc.attributes...).Inc()
 }
 
-// Observe observes the request latency and failed requests.
-func (mc *MetricContext) Observe(rerr *retry.Error) {
-	apiMetrics.latency.WithLabelValues(mc.attributes...).Observe(
-		time.Since(mc.start).Seconds())
-	if rerr != nil {
-		errorCode := rerr.ServiceErrorCode()
-		attributes := append(mc.attributes, errorCode)
-		apiMetrics.errors.WithLabelValues(attributes...).Inc()
-	}
-}
-
 // ObserveOperationWithResult observes the request latency and failed requests of an operation.
-func (mc *MetricContext) ObserveOperationWithResult(isOperationSucceeded bool) {
-	operationMetrics.operationLatency.WithLabelValues(mc.attributes...).Observe(
-		time.Since(mc.start).Seconds())
+func (mc *MetricContext) ObserveOperationWithResult(isOperationSucceeded bool, labelAndValues ...interface{}) {
+	latency := time.Since(mc.start).Seconds()
+	operationMetrics.operationLatency.WithLabelValues(mc.attributes...).Observe(latency)
+	resultCode := "succeeded"
 	if !isOperationSucceeded {
+		resultCode = "failed"
+		if len(mc.attributes) > 0 {
+			resultCode += mc.attributes[0][strings.Index(mc.attributes[0], "_"):]
+		}
 		mc.CountFailedOperation()
 	}
+	mc.logLatency(mc.LogLevel, latency, append(labelAndValues, "result_code", resultCode)...)
+}
+
+func (mc *MetricContext) logLatency(logLevel int32, latency float64, additionalKeysAndValues ...interface{}) {
+	logger := log.Background().WithName("logLatency")
+	keysAndValues := []interface{}{"latency_seconds", latency}
+	for i, label := range metricLabels {
+		keysAndValues = append(keysAndValues, label, mc.attributes[i])
+	}
+	logger.V(int(logLevel)).Info("Observed Request Latency", append(keysAndValues, additionalKeysAndValues...)...)
 }
 
 // CountFailedOperation increase the number of failed operations

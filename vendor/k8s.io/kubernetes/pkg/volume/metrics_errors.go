@@ -23,7 +23,11 @@ import (
 const (
 	// ErrCodeNotSupported code for NotSupported Errors.
 	ErrCodeNotSupported int = iota + 1
+
+	// ErrCodeNoPathDefined code for NoPathDefined Errors.
 	ErrCodeNoPathDefined
+
+	// ErrCodeFsInfoFailed code for FsInfoFailed Errors.
 	ErrCodeFsInfoFailed
 )
 
@@ -32,6 +36,14 @@ func NewNotSupportedError() *MetricsError {
 	return &MetricsError{
 		Code: ErrCodeNotSupported,
 		Msg:  "metrics are not supported for MetricsNil Volumes",
+	}
+}
+
+// NewNotImplementedError creates a new MetricsError with code NotSupported.
+func NewNotImplementedError(reason string) *MetricsError {
+	return &MetricsError{
+		Code: ErrCodeNotSupported,
+		Msg:  fmt.Sprintf("metrics support is not implemented: %s", reason),
 	}
 }
 

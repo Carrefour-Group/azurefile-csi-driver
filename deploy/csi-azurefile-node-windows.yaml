@@ -34,12 +34,15 @@ spec:
                     values:
                       - virtual-kubelet
       priorityClassName: system-node-critical
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: liveness-probe
           volumeMounts:
             - mountPath: C:\csi
               name: plugin-dir
-          image: mcr.microsoft.com/oss/kubernetes-csi/livenessprobe:v2.4.0
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/livenessprobe:v2.20.0
           args:
             - --csi-address=$(CSI_ENDPOINT)
             - --probe-timeout=3s
@@ -50,24 +53,20 @@ spec:
               value: unix://C:\\csi\\csi.sock
           resources:
             limits:
-              cpu: 200m
-              memory: 200Mi
+              memory: 150Mi
             requests:
               cpu: 10m
-              memory: 20Mi
+              memory: 40Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
         - name: node-driver-registrar
-          image: mcr.microsoft.com/oss/kubernetes-csi/csi-node-driver-registrar:v2.3.0
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/csi-node-driver-registrar:v2.18.0
           args:
             - --v=2
             - --csi-address=$(CSI_ENDPOINT)
             - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
-          livenessProbe:
-            exec:
-              command:
-                - /csi-node-driver-registrar.exe
-                - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
-                - --mode=kubelet-registration-probe
-            initialDelaySeconds: 3
           env:
             - name: CSI_ENDPOINT
               value: unix://C:\\csi\\csi.sock
@@ -86,11 +85,14 @@ spec:
               mountPath: C:\registration
           resources:
             limits:
-              cpu: 200m
-              memory: 200Mi
+              memory: 150Mi
             requests:
-              cpu: 10m
-              memory: 20Mi
+              cpu: 30m
+              memory: 40Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
         - name: azurefile
           image: mcr.microsoft.com/k8s/csi/azurefile-csi:latest
           imagePullPolicy: IfNotPresent
@@ -98,8 +100,7 @@ spec:
             - --v=5
             - --endpoint=$(CSI_ENDPOINT)
             - --nodeid=$(KUBE_NODE_NAME)
-            - --kubeconfig=C:\\k\\config
-            - --metrics-address=0.0.0.0:29615
+            - --metrics-address="0.0.0.0:29615"
           ports:
             - containerPort: 29613
               name: healthz
@@ -109,9 +110,9 @@ spec:
             httpGet:
               path: /healthz
               port: healthz
-            initialDelaySeconds: 30
-            timeoutSeconds: 10
-            periodSeconds: 30
+            initialDelaySeconds: 60
+            timeoutSeconds: 60
+            periodSeconds: 60
           env:
             - name: AZURE_CREDENTIAL_FILE
               valueFrom:
@@ -145,30 +146,29 @@ spec:
               mountPath: \\.\pipe\csi-proxy-smb-v1beta1
           resources:
             limits:
-              cpu: 400m
-              memory: 400Mi
+              memory: 200Mi
             requests:
               cpu: 10m
-              memory: 20Mi
+              memory: 40Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: csi-proxy-fs-pipe-v1
           hostPath:
             path: \\.\pipe\csi-proxy-filesystem-v1
-            type: ""
         - name: csi-proxy-smb-pipe-v1
           hostPath:
             path: \\.\pipe\csi-proxy-smb-v1
-            type: ""
         # these paths are still included for compatibility, they're used
         # only if the node has still the beta version of the CSI proxy
         - name: csi-proxy-fs-pipe-v1beta1
           hostPath:
             path: \\.\pipe\csi-proxy-filesystem-v1beta1
-            type: ""
         - name: csi-proxy-smb-pipe-v1beta1
           hostPath:
             path: \\.\pipe\csi-proxy-smb-v1beta1
-            type: ""
         - name: registration-dir
           hostPath:
             path: C:\var\lib\kubelet\plugins_registry\
@@ -184,4 +184,4 @@ spec:
         - name: azure-config
           hostPath:
             path: C:\k
-            type: Directory
+            type: DirectoryOrCreate

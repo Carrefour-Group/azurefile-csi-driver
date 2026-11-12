@@ -17,19 +17,23 @@ limitations under the License.
 package provider
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"strings"
+	"time"
 
-	"k8s.io/klog/v2"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 )
 
 // NetworkMetadata contains metadata about an instance's network
 type NetworkMetadata struct {
-	Interface []NetworkInterface `json:"interface"`
+	Interface []*NetworkInterface `json:"interface"`
 }
 
 // NetworkInterface represents an instances network interface.
@@ -39,7 +43,7 @@ type NetworkInterface struct {
 	MAC  string      `json:"macAddress"`
 }
 
-// NetworkData contains IP information for a network.
+// NetworkData contains IP information for a armnetwork.
 type NetworkData struct {
 	IPAddress []IPAddress `json:"ipAddress"`
 	Subnet    []Subnet    `json:"subnet"`
@@ -57,20 +61,29 @@ type Subnet struct {
 	Prefix  string `json:"prefix"`
 }
 
+// Tag represents a key-value tag in IMDS.
+type Tag struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 // ComputeMetadata represents compute information
 type ComputeMetadata struct {
-	Environment    string `json:"azEnvironment,omitempty"`
-	SKU            string `json:"sku,omitempty"`
-	Name           string `json:"name,omitempty"`
-	Zone           string `json:"zone,omitempty"`
-	VMSize         string `json:"vmSize,omitempty"`
-	OSType         string `json:"osType,omitempty"`
-	Location       string `json:"location,omitempty"`
-	FaultDomain    string `json:"platformFaultDomain,omitempty"`
-	UpdateDomain   string `json:"platformUpdateDomain,omitempty"`
-	ResourceGroup  string `json:"resourceGroupName,omitempty"`
-	VMScaleSetName string `json:"vmScaleSetName,omitempty"`
-	SubscriptionID string `json:"subscriptionId,omitempty"`
+	Environment            string `json:"azEnvironment,omitempty"`
+	SKU                    string `json:"SKU,omitempty"`
+	Name                   string `json:"name,omitempty"`
+	Zone                   string `json:"zone,omitempty"`
+	VMSize                 string `json:"vmSize,omitempty"`
+	OSType                 string `json:"osType,omitempty"`
+	Location               string `json:"location,omitempty"`
+	FaultDomain            string `json:"platformFaultDomain,omitempty"`
+	PlatformSubFaultDomain string `json:"platformSubFaultDomain,omitempty"`
+	UpdateDomain           string `json:"platformUpdateDomain,omitempty"`
+	ResourceGroup          string `json:"resourceGroupName,omitempty"`
+	VMScaleSetName         string `json:"vmScaleSetName,omitempty"`
+	SubscriptionID         string `json:"subscriptionId,omitempty"`
+	ResourceID             string `json:"resourceId,omitempty"`
+	TagsList               []Tag  `json:"tagsList,omitempty"`
 }
 
 // InstanceMetadata represents instance information.
@@ -98,7 +111,7 @@ type LoadBalancerMetadata struct {
 // InstanceMetadataService knows how to query the Azure instance metadata server.
 type InstanceMetadataService struct {
 	imdsServer string
-	imsCache   *azcache.TimedCache
+	imsCache   azcache.Resource
 }
 
 // NewInstanceMetadataService creates an instance of the InstanceMetadataService accessor object.
@@ -107,7 +120,7 @@ func NewInstanceMetadataService(imdsServer string) (*InstanceMetadataService, er
 		imdsServer: imdsServer,
 	}
 
-	imsCache, err := azcache.NewTimedcache(consts.MetadataCacheTTL, ims.getMetadata)
+	imsCache, err := azcache.NewTimedCache(consts.MetadataCacheTTL, ims.getMetadata, false)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +129,35 @@ func NewInstanceMetadataService(imdsServer string) (*InstanceMetadataService, er
 	return ims, nil
 }
 
-func (ims *InstanceMetadataService) getMetadata(key string) (interface{}, error) {
+// fillNetInterfacePublicIPs finds PIPs from imds load balancer and fills them into net interface config.
+func fillNetInterfacePublicIPs(publicIPs []PublicIPMetadata, netInterface *NetworkInterface) {
+	// IPv6 IPs from imds load balancer are wrapped by brackets while those from imds are not.
+	trimIP := func(ip string) string {
+		return strings.Trim(strings.Trim(ip, "["), "]")
+	}
+
+	if len(netInterface.IPV4.IPAddress) > 0 && len(netInterface.IPV4.IPAddress[0].PrivateIP) > 0 {
+		for _, pip := range publicIPs {
+			if pip.PrivateIPAddress == netInterface.IPV4.IPAddress[0].PrivateIP {
+				netInterface.IPV4.IPAddress[0].PublicIP = pip.FrontendIPAddress
+				break
+			}
+		}
+	}
+	if len(netInterface.IPV6.IPAddress) > 0 && len(netInterface.IPV6.IPAddress[0].PrivateIP) > 0 {
+		for _, pip := range publicIPs {
+			privateIP := trimIP(pip.PrivateIPAddress)
+			frontendIP := trimIP(pip.FrontendIPAddress)
+			if privateIP == netInterface.IPV6.IPAddress[0].PrivateIP {
+				netInterface.IPV6.IPAddress[0].PublicIP = frontendIP
+				break
+			}
+		}
+	}
+}
+
+func (ims *InstanceMetadataService) getMetadata(ctx context.Context, key string) (interface{}, error) {
+	logger := log.FromContextOrBackground(ctx).WithName("getMetadata")
 	instanceMetadata, err := ims.getInstanceMetadata(key)
 	if err != nil {
 		return nil, err
@@ -134,33 +175,18 @@ func (ims *InstanceMetadataService) getMetadata(key string) (interface{}, error)
 		if err != nil || loadBalancerMetadata == nil || loadBalancerMetadata.LoadBalancer == nil {
 			// Log a warning since loadbalancer metadata may not be available when the VM
 			// is not in standard LoadBalancer backend address pool.
-			klog.V(4).Infof("Warning: failed to get loadbalancer metadata: %v", err)
+			logger.V(4).Info("Warning: failed to get loadbalancer metadata", "error", err)
 			return instanceMetadata, nil
 		}
 
 		publicIPs := loadBalancerMetadata.LoadBalancer.PublicIPAddresses
-		if len(netInterface.IPV4.IPAddress) > 0 && len(netInterface.IPV4.IPAddress[0].PrivateIP) > 0 {
-			for _, pip := range publicIPs {
-				if pip.PrivateIPAddress == netInterface.IPV4.IPAddress[0].PrivateIP {
-					netInterface.IPV4.IPAddress[0].PublicIP = pip.FrontendIPAddress
-					break
-				}
-			}
-		}
-		if len(netInterface.IPV6.IPAddress) > 0 && len(netInterface.IPV6.IPAddress[0].PrivateIP) > 0 {
-			for _, pip := range publicIPs {
-				if pip.PrivateIPAddress == netInterface.IPV6.IPAddress[0].PrivateIP {
-					netInterface.IPV6.IPAddress[0].PublicIP = pip.FrontendIPAddress
-					break
-				}
-			}
-		}
+		fillNetInterfacePublicIPs(publicIPs, netInterface)
 	}
 
 	return instanceMetadata, nil
 }
 
-func (ims *InstanceMetadataService) getInstanceMetadata(key string) (*InstanceMetadata, error) {
+func (ims *InstanceMetadataService) getInstanceMetadata(_ string) (*InstanceMetadata, error) {
 	req, err := http.NewRequest("GET", ims.imdsServer+consts.ImdsInstanceURI, nil)
 	if err != nil {
 		return nil, err
@@ -173,7 +199,7 @@ func (ims *InstanceMetadataService) getInstanceMetadata(key string) (*InstanceMe
 	q.Add("api-version", consts.ImdsInstanceAPIVersion)
 	req.URL.RawQuery = q.Encode()
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -184,7 +210,7 @@ func (ims *InstanceMetadataService) getInstanceMetadata(key string) (*InstanceMe
 		return nil, fmt.Errorf("failure of getting instance metadata with response %q", resp.Status)
 	}
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +237,7 @@ func (ims *InstanceMetadataService) getLoadBalancerMetadata() (*LoadBalancerMeta
 	q.Add("api-version", consts.ImdsLoadBalancerAPIVersion)
 	req.URL.RawQuery = q.Encode()
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -222,7 +248,7 @@ func (ims *InstanceMetadataService) getLoadBalancerMetadata() (*LoadBalancerMeta
 		return nil, fmt.Errorf("failure of getting loadbalancer metadata with response %q", resp.Status)
 	}
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -238,8 +264,8 @@ func (ims *InstanceMetadataService) getLoadBalancerMetadata() (*LoadBalancerMeta
 
 // GetMetadata gets instance metadata from cache.
 // crt determines if we can get data from stalled cache/need fresh if cache expired.
-func (ims *InstanceMetadataService) GetMetadata(crt azcache.AzureCacheReadType) (*InstanceMetadata, error) {
-	cache, err := ims.imsCache.Get(consts.MetadataCacheKey, crt)
+func (ims *InstanceMetadataService) GetMetadata(ctx context.Context, crt azcache.AzureCacheReadType) (*InstanceMetadata, error) {
+	cache, err := ims.imsCache.Get(ctx, consts.MetadataCacheKey, crt)
 	if err != nil {
 		return nil, err
 	}
@@ -254,4 +280,54 @@ func (ims *InstanceMetadataService) GetMetadata(crt azcache.AzureCacheReadType) 
 	}
 
 	return nil, fmt.Errorf("failure of getting instance metadata")
+}
+
+// GetPlatformSubFaultDomain returns the PlatformSubFaultDomain from IMDS if set.
+func (az *Cloud) GetPlatformSubFaultDomain(ctx context.Context) (string, error) {
+	logger := log.FromContextOrBackground(ctx).WithName("GetPlatformSubFaultDomain")
+	if az.UseInstanceMetadata {
+		metadata, err := az.Metadata.GetMetadata(ctx, azcache.CacheReadTypeUnsafe)
+		if err != nil {
+			logger.Error(err, "failed to GetMetadata")
+			return "", err
+		}
+		if metadata.Compute == nil {
+			_ = az.Metadata.imsCache.Delete(consts.MetadataCacheKey)
+			return "", errors.New("failure of getting compute information from instance metadata")
+		}
+		return metadata.Compute.PlatformSubFaultDomain, nil
+	}
+	return "", nil
+}
+
+// GetInterconnectGroupID returns the Platform Interconnect Group ID from IMDS if set.
+// It reads the value from the Platform_Interconnect_Group tag in tagsList.
+func (az *Cloud) GetInterconnectGroupID(ctx context.Context) (string, error) {
+	logger := log.FromContextOrBackground(ctx).WithName("GetInterconnectGroupID")
+	if az.UseInstanceMetadata {
+		metadata, err := az.Metadata.GetMetadata(ctx, azcache.CacheReadTypeUnsafe)
+		if err != nil {
+			return "", err
+		}
+		if metadata.Compute == nil {
+			_ = az.Metadata.imsCache.Delete(consts.MetadataCacheKey)
+			return "", errors.New("failure of getting compute information from instance metadata")
+		}
+
+		// Check tagsList for Platform_Interconnect_Group tag
+		for _, tag := range metadata.Compute.TagsList {
+			if tag.Name == consts.TagNameInterconnectGroup {
+				if tag.Value == "" {
+					logger.V(4).Info("Interconnect Group tag is present but value is empty")
+					return "", nil
+				}
+				logger.V(2).Info("found Interconnect Group ID from tagsList", "InterconnectGroupID", tag.Value)
+				return tag.Value, nil
+			}
+		}
+
+		// Tag not found - this is normal for VMs without Interconnect Groups
+		logger.V(4).Info("Tag not found in IMDS", "tagName", consts.TagNameInterconnectGroup)
+	}
+	return "", nil
 }

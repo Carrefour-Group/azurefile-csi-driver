@@ -18,6 +18,7 @@ spec:
         app: csi-azurefile-node
     spec:
       hostNetwork: true
+      hostPID: true
       dnsPolicy: Default
       serviceAccountName: csi-azurefile-node-sa
       nodeSelector:
@@ -32,36 +33,72 @@ spec:
                     values:
                       - virtual-kubelet
       priorityClassName: system-node-critical
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       tolerations:
         - operator: "Exists"
+      initContainers:
+        - name: install-azurefile-proxy
+          image: mcr.microsoft.com/k8s/csi/azurefile-csi:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - "/azurefile-proxy/init.sh"
+          securityContext:
+            privileged: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: DEBIAN_FRONTEND
+              value: "noninteractive"
+            - name: AZNFS_NONINTERACTIVE_INSTALL
+              value: "1"
+            - name: INSTALL_AZUREFILE_PROXY
+              value: "true"
+            - name: INSTALL_AZNFS_MOUNT
+              value: "true"
+            - name: ENABLE_MI_AUTH
+              value: "true"
+          volumeMounts:
+            - name: host-usr
+              mountPath: /host/usr
+            - name: host-etc
+              mountPath: /host/etc
+            - name: mountpoint-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: kerberos-dir
+              mountPath: /var/lib/kubelet/kerberos
+              mountPropagation: Bidirectional
       containers:
         - name: liveness-probe
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
-          image: mcr.microsoft.com/oss/kubernetes-csi/livenessprobe:v2.4.0
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/livenessprobe:v2.20.0
           args:
             - --csi-address=/csi/csi.sock
             - --probe-timeout=3s
-            - --health-port=29613
+            - --http-endpoint=localhost:29613
             - --v=2
           resources:
             limits:
-              cpu: 100m
               memory: 100Mi
             requests:
               cpu: 10m
               memory: 20Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
         - name: node-driver-registrar
-          image: mcr.microsoft.com/oss/kubernetes-csi/csi-node-driver-registrar:v2.3.0
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/csi-node-driver-registrar:v2.18.0
           args:
             - --csi-address=$(ADDRESS)
             - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
             - --v=2
-          lifecycle:
-            preStop:
-              exec:
-                command: ["/bin/sh", "-c", "rm -rf /registration/file.csi.azure.com-reg.sock /csi/csi.sock"]
+            - --http-endpoint=localhost:29617
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -74,28 +111,44 @@ spec:
               mountPath: /registration
           resources:
             limits:
-              cpu: 100m
               memory: 100Mi
             requests:
               cpu: 10m
               memory: 20Mi
+          ports:
+            - name: healthz
+              containerPort: 29617
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              host: localhost
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 20
+            timeoutSeconds: 10
+            periodSeconds: 20
+            failureThreshold: 2
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
         - name: azurefile
           image: mcr.microsoft.com/k8s/csi/azurefile-csi:latest
           imagePullPolicy: IfNotPresent
           args:
             - "--v=5"
             - "--endpoint=$(CSI_ENDPOINT)"
+            - "--enable-azurefile-proxy=true"
+            - "--azurefile-proxy-endpoint=$(AZUREFILE_PROXY_ENDPOINT)"
             - "--nodeid=$(KUBE_NODE_NAME)"
             - "--metrics-address=0.0.0.0:29615"
-          ports:
-            - containerPort: 29613
-              name: healthz
-              protocol: TCP
+            - "--enable-kata-cc-mount=true"
           livenessProbe:
             failureThreshold: 5
             httpGet:
+              host: localhost
               path: /healthz
-              port: healthz
+              port: 29613
             initialDelaySeconds: 30
             timeoutSeconds: 10
             periodSeconds: 30
@@ -108,6 +161,8 @@ spec:
                   optional: true
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
+            - name: AZUREFILE_PROXY_ENDPOINT
+              value: unix:///csi/azurefile-proxy.sock
             - name: KUBE_NODE_NAME
               valueFrom:
                 fieldRef:
@@ -115,48 +170,113 @@ spec:
                   fieldPath: spec.nodeName
           securityContext:
             privileged: true
+            capabilities:
+              drop:
+                - ALL
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
-            - mountPath: /var/lib/kubelet/
+            - mountPath: /var/lib/kubelet/pods
               mountPropagation: Bidirectional
               name: mountpoint-dir
+            - mountPath: /var/lib/kubelet/plugins
+              mountPropagation: Bidirectional
+              name: plugins-dir
+            - mountPath: /var/lib/kubelet/kerberos
+              mountPropagation: Bidirectional
+              name: kerberos-dir
             - mountPath: /etc/kubernetes/
               name: azure-cred
-            - mountPath: /var/lib/waagent/ManagedIdentity-Settings
               readOnly: true
-              name: msi
             - mountPath: /dev
               name: device-dir
+            - mountPath: /run/kata-containers/shared/direct-volumes
+              name: kata-direct-volumes
+            - name: azfilesauth
+              mountPath: /etc/azfilesauth
+            - name: log-dir
+              mountPath: /var/log/
           resources:
             limits:
-              cpu: 400m
-              memory: 300Mi
+              memory: 400Mi
+            requests:
+              cpu: 10m
+              memory: 20Mi
+        - name: azfilesrefresh
+          image: mcr.microsoft.com/k8s/csi/azurefile-csi:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - "azfilesrefresh"
+          securityContext:
+            privileged: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+              name: mountpoint-dir
+            - mountPath: /var/lib/kubelet/plugins
+              mountPropagation: Bidirectional
+              name: plugins-dir
+            - mountPath: /var/lib/kubelet/kerberos
+              mountPropagation: Bidirectional
+              name: kerberos-dir
+            - name: azfilesauth
+              mountPath: /etc/azfilesauth
+            - name: log-dir
+              mountPath: /var/log/
+          resources:
+            limits:
+              memory: 256Mi
             requests:
               cpu: 10m
               memory: 20Mi
       volumes:
+        - name: host-usr
+          hostPath:
+            path: /usr
+        - name: host-etc
+          hostPath:
+            path: /etc
+        - name: azfilesauth
+          hostPath:
+            path: /etc/azfilesauth
+            type: DirectoryOrCreate
         - hostPath:
             path: /var/lib/kubelet/plugins/file.csi.azure.com
             type: DirectoryOrCreate
           name: socket-dir
         - hostPath:
-            path: /var/lib/kubelet/
+            path: /var/lib/kubelet/pods
             type: DirectoryOrCreate
           name: mountpoint-dir
+        - hostPath:
+            path: /var/lib/kubelet/plugins
+            type: DirectoryOrCreate
+          name: plugins-dir
+        - hostPath:
+            path: /var/lib/kubelet/kerberos
+            type: DirectoryOrCreate
+          name: kerberos-dir
         - hostPath:
             path: /var/lib/kubelet/plugins_registry/
             type: DirectoryOrCreate
           name: registration-dir
         - hostPath:
             path: /etc/kubernetes/
-            type: Directory
+            type: DirectoryOrCreate
           name: azure-cred
-        - hostPath:
-            path: /var/lib/waagent/ManagedIdentity-Settings
-          name: msi
         - hostPath:
             path: /dev
             type: Directory
           name: device-dir
+        - name: kata-direct-volumes
+          hostPath:
+            path: /run/kata-containers/shared/direct-volumes/
+            type: DirectoryOrCreate
+        - hostPath:
+            path: /var/log/
+            type: DirectoryOrCreate
+          name: log-dir
 ---

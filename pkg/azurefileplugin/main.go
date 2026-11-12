@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 
 	"sigs.k8s.io/azurefile-csi-driver/pkg/azurefile"
@@ -33,59 +34,58 @@ import (
 
 func init() {
 	klog.InitFlags(nil)
+	driverOptions.AddFlags().VisitAll(func(f *flag.Flag) {
+		flag.CommandLine.Var(f.Value, f.Name, f.Usage)
+	})
 }
 
 var (
-	endpoint                   = flag.String("endpoint", "unix://tmp/csi.sock", "CSI endpoint")
-	nodeID                     = flag.String("nodeid", "", "node id")
-	version                    = flag.Bool("version", false, "Print the version and exit.")
-	metricsAddress             = flag.String("metrics-address", "0.0.0.0:29614", "export the metrics")
-	kubeconfig                 = flag.String("kubeconfig", "", "Absolute path to the kubeconfig file. Required only when running out of cluster.")
-	driverName                 = flag.String("drivername", azurefile.DefaultDriverName, "name of the driver")
-	cloudConfigSecretName      = flag.String("cloud-config-secret-name", "azure-cloud-provider", "secret name of cloud config")
-	cloudConfigSecretNamespace = flag.String("cloud-config-secret-namespace", "kube-system", "secret namespace of cloud config")
-	customUserAgent            = flag.String("custom-user-agent", "", "custom userAgent")
-	userAgentSuffix            = flag.String("user-agent-suffix", "", "userAgent suffix")
+	version        = flag.Bool("version", false, "Print the version and exit.")
+	metricsAddress = flag.String("metrics-address", "", "export the metrics")
+	driverOptions  azurefile.DriverOptions
 )
 
+// exit is a separate function to handle program termination
+var exit = func(code int) {
+	os.Exit(code)
+}
+
 func main() {
+	// Opt into the new klog behavior so that -stderrthreshold is honored
+	// even when -logtostderr=true (requires klog v2.140.0+).
+	_ = flag.Set("legacy_stderr_threshold_behavior", "false")
+	_ = flag.Set("stderrthreshold", "INFO")
 	flag.Parse()
 	if *version {
-		info, err := azurefile.GetVersionYAML(*driverName)
+		info, err := azurefile.GetVersionYAML(driverOptions.DriverName)
 		if err != nil {
 			klog.Fatalln(err)
 		}
-		fmt.Println(info)
-		os.Exit(0)
+		fmt.Println(info) // nolint
+	} else {
+		exportMetrics()
+		handle()
 	}
-
-	if *nodeID == "" {
-		// nodeid is not needed in controller component
-		klog.Warning("nodeid is empty")
-	}
-
-	exportMetrics()
-	handle()
-	os.Exit(0)
+	exit(0)
 }
 
 func handle() {
-	driverOptions := azurefile.DriverOptions{
-		NodeID:                     *nodeID,
-		DriverName:                 *driverName,
-		CloudConfigSecretName:      *cloudConfigSecretName,
-		CloudConfigSecretNamespace: *cloudConfigSecretNamespace,
-		CustomUserAgent:            *customUserAgent,
-		UserAgentSuffix:            *userAgentSuffix,
-	}
+	runtime.GOMAXPROCS(driverOptions.GoMaxProcs)
+	klog.Infof("Sys info: NumCPU: %v MAXPROC: %v", runtime.NumCPU(), runtime.GOMAXPROCS(0))
+
 	driver := azurefile.NewDriver(&driverOptions)
 	if driver == nil {
 		klog.Fatalln("Failed to initialize azurefile CSI Driver")
 	}
-	driver.Run(*endpoint, *kubeconfig, false)
+	if err := driver.Run(context.Background()); err != nil {
+		klog.Fatalln(err)
+	}
 }
 
 func exportMetrics() {
+	if *metricsAddress == "" {
+		return
+	}
 	l, err := net.Listen("tcp", *metricsAddress)
 	if err != nil {
 		klog.Warningf("failed to get listener for metrics endpoint: %v", err)
@@ -94,7 +94,7 @@ func exportMetrics() {
 	serve(context.Background(), l, serveMetrics)
 }
 
-func serve(ctx context.Context, l net.Listener, serveFunc func(net.Listener) error) {
+func serve(_ context.Context, l net.Listener, serveFunc func(net.Listener) error) {
 	path := l.Addr().String()
 	klog.V(2).Infof("set up prometheus server on %v", path)
 	go func() {

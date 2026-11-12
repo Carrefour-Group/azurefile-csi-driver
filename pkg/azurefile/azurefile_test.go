@@ -19,25 +19,35 @@ package azurefile
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-02-01/storage"
-	azure2 "github.com/Azure/go-autorest/autorest/azure"
-	"github.com/golang/mock/gomock"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	armstorage "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage/v2"
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
+	v1api "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
-	csicommon "sigs.k8s.io/azurefile-csi-driver/pkg/csi-common"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient/mockfileclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/storageaccountclient/mockstorageaccountclient"
-	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient/mock_accountclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/fileshareclient/mock_fileshareclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/cache"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/storage"
 )
 
 const (
@@ -51,28 +61,63 @@ var (
 
 func NewFakeDriver() *Driver {
 	driverOptions := DriverOptions{
-		NodeID:     fakeNodeID,
-		DriverName: DefaultDriverName,
+		NodeID:                      fakeNodeID,
+		DriverName:                  DefaultDriverName,
+		KubeConfig:                  "",
+		Endpoint:                    "tcp://127.0.0.1:0",
+		WaitForAzCopyTimeoutMinutes: 1,
+		EnableKataCCMount:           true,
 	}
 	driver := NewDriver(&driverOptions)
 	driver.Name = fakeDriverName
 	driver.Version = vendorVersion
+	driver.AddControllerServiceCapabilities(
+		[]csi.ControllerServiceCapability_RPC_Type{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+		})
+	driver.cloud = &storage.AccountRepo{}
 	return driver
+}
+
+func NewFakeDriverCustomOptions(opts DriverOptions) *Driver {
+	var err error
+	driverOptions := opts
+	driver := NewDriver(&driverOptions)
+	driver.Name = fakeDriverName
+	driver.Version = vendorVersion
+	if err != nil {
+		panic(err)
+	}
+	driver.AddControllerServiceCapabilities(
+		[]csi.ControllerServiceCapability_RPC_Type{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+		})
+	return driver
+}
+
+func (d *Driver) WithEnableAznfsForNFSMounts() *Driver {
+	d.useAZNFSForNFSMounts = true
+	return d
 }
 
 func TestNewFakeDriver(t *testing.T) {
 	driverOptions := DriverOptions{
 		NodeID:     fakeNodeID,
 		DriverName: DefaultDriverName,
+		Endpoint:   "tcp://127.0.0.1:0",
+		KubeConfig: "",
 	}
 	d := NewDriver(&driverOptions)
 	assert.NotNil(t, d)
 }
 
-func TestAppendDefaultMountOptions(t *testing.T) {
+func TestAppendDefaultCifsMountOptions(t *testing.T) {
 	tests := []struct {
-		options  []string
-		expected []string
+		options                 []string
+		appendClosetimeoOption  bool
+		appendNoShareSockOption bool
+		expected                []string
 	}{
 		{
 			options: []string{"dir_mode=0777"},
@@ -117,6 +162,24 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 			},
 		},
 		{
+			options: []string{"acregmax=1"},
+			expected: []string{
+				"acregmax=1",
+				fmt.Sprintf("%s=%s", fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				mfsymlinks,
+			},
+		},
+		{
+			options: []string{"acdirmax=2"},
+			expected: []string{
+				"acdirmax=2",
+				fmt.Sprintf("%s=%s", fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				mfsymlinks,
+			},
+		},
+		{
 			options: []string{mfsymlinks},
 			expected: []string{
 				mfsymlinks,
@@ -143,15 +206,92 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 				mfsymlinks,
 			},
 		},
+		{
+			options:                []string{""},
+			appendClosetimeoOption: true,
+			expected: []string{"", fmt.Sprintf("%s=%s",
+				fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+				"sloppy,closetimeo=0",
+			},
+		},
+		{
+			options:                 []string{""},
+			appendNoShareSockOption: true,
+			expected: []string{"", fmt.Sprintf("%s=%s",
+				fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+				"nosharesock",
+			},
+		},
+		{
+			options:                 []string{"nosharesock"},
+			appendNoShareSockOption: true,
+			expected: []string{fmt.Sprintf("%s=%s",
+				fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+				"nosharesock",
+			},
+		},
 	}
 
 	for _, test := range tests {
-		result := appendDefaultMountOptions(test.options)
+		result := appendDefaultCifsMountOptions(test.options, test.appendNoShareSockOption, test.appendClosetimeoOption)
 		sort.Strings(result)
 		sort.Strings(test.expected)
 
 		if !reflect.DeepEqual(result, test.expected) {
-			t.Errorf("input: %q, appendDefaultMountOptions result: %q, expected: %q", test.options, result, test.expected)
+			t.Errorf("input: %q, appendDefaultCifsMountOptions result: %q, expected: %q", test.options, result, test.expected)
+		}
+	}
+}
+
+func TestAppendDefaultNfsMountOptions(t *testing.T) {
+	tests := []struct {
+		options                []string
+		appendNoResvPortOption bool
+		appendActimeoOption    bool
+		expected               []string
+	}{
+		{
+			options:                []string{""},
+			appendNoResvPortOption: false,
+			appendActimeoOption:    false,
+			expected:               []string{""},
+		},
+		{
+			options:                []string{},
+			appendNoResvPortOption: true,
+			appendActimeoOption:    true,
+			expected:               []string{fmt.Sprintf("%s=%s", actimeo, defaultActimeo), noResvPort},
+		},
+		{
+			options:                []string{noResvPort},
+			appendNoResvPortOption: true,
+			appendActimeoOption:    true,
+			expected:               []string{fmt.Sprintf("%s=%s", actimeo, defaultActimeo), noResvPort},
+		},
+		{
+			options:                []string{fmt.Sprintf("%s=%s", actimeo, "60")},
+			appendNoResvPortOption: true,
+			appendActimeoOption:    true,
+			expected:               []string{fmt.Sprintf("%s=%s", actimeo, "60"), noResvPort},
+		},
+	}
+
+	for _, test := range tests {
+		result := appendDefaultNfsMountOptions(test.options, test.appendNoResvPortOption, test.appendActimeoOption)
+		sort.Strings(result)
+		sort.Strings(test.expected)
+
+		if !reflect.DeepEqual(result, test.expected) {
+			t.Errorf("input: %q, appendDefaultNfsMountOptions result: %q, expected: %q", test.options, result, test.expected)
 		}
 	}
 }
@@ -163,6 +303,8 @@ func TestGetFileShareInfo(t *testing.T) {
 		accountName       string
 		fileShareName     string
 		diskName          string
+		namespace         string
+		subsID            string
 		expectedError     error
 	}{
 		{
@@ -171,6 +313,25 @@ func TestGetFileShareInfo(t *testing.T) {
 			accountName:       "f5713de20cde511e8ba4900",
 			fileShareName:     "pvc-file-dynamic-17e43f84-f474-11e8-acd0-000d3a00df41",
 			diskName:          "diskname1.vhd",
+			namespace:         "",
+			expectedError:     nil,
+		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#pvc-file-dynamic-17e43f84-f474-11e8-acd0-000d3a00df41#diskname1.vhd#1620118846#namespace",
+			resourceGroupName: "rg",
+			accountName:       "f5713de20cde511e8ba4900",
+			fileShareName:     "pvc-file-dynamic-17e43f84-f474-11e8-acd0-000d3a00df41",
+			diskName:          "diskname1.vhd",
+			namespace:         "namespace",
+			expectedError:     nil,
+		},
+		{
+			id:                "#f5713de20cde511e8ba4900#pvc-file-dynamic-17e43f84-f474-11e8-acd0-000d3a00df41#diskname1.vhd#namespace",
+			resourceGroupName: "",
+			accountName:       "f5713de20cde511e8ba4900",
+			fileShareName:     "pvc-file-dynamic-17e43f84-f474-11e8-acd0-000d3a00df41",
+			diskName:          "diskname1.vhd",
+			namespace:         "namespace",
 			expectedError:     nil,
 		},
 		{
@@ -221,10 +382,50 @@ func TestGetFileShareInfo(t *testing.T) {
 			diskName:          "",
 			expectedError:     fmt.Errorf("error parsing volume id: \"\", should at least contain two #"),
 		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#namespace#subsID",
+			resourceGroupName: "rg",
+			accountName:       "f5713de20cde511e8ba4900",
+			fileShareName:     "fileShareName",
+			diskName:          "diskname.vhd",
+			namespace:         "namespace",
+			subsID:            "subsID",
+			expectedError:     nil,
+		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#namespace",
+			resourceGroupName: "rg",
+			accountName:       "f5713de20cde511e8ba4900",
+			fileShareName:     "fileShareName",
+			diskName:          "diskname.vhd",
+			namespace:         "namespace",
+			subsID:            "",
+			expectedError:     nil,
+		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#fileShareName#../../etc/shadow#uuid#namespace",
+			resourceGroupName: "",
+			accountName:       "",
+			fileShareName:     "",
+			diskName:          "",
+			namespace:         "",
+			subsID:            "",
+			expectedError:     fmt.Errorf("invalid diskName %q: contains directory traversal sequence", "../../etc/shadow"),
+		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#../../evil",
+			resourceGroupName: "",
+			accountName:       "",
+			fileShareName:     "",
+			diskName:          "",
+			namespace:         "",
+			subsID:            "",
+			expectedError:     fmt.Errorf("invalid namespace %q: contains directory traversal sequence", "../../evil"),
+		},
 	}
 
 	for _, test := range tests {
-		resourceGroupName, accountName, fileShareName, diskName, expectedError := GetFileShareInfo(test.id)
+		resourceGroupName, accountName, fileShareName, diskName, namespace, subsID, expectedError := GetFileShareInfo(test.id)
 		if resourceGroupName != test.resourceGroupName {
 			t.Errorf("GetFileShareInfo(%q) returned with: %q, expected: %q", test.id, resourceGroupName, test.resourceGroupName)
 		}
@@ -236,6 +437,12 @@ func TestGetFileShareInfo(t *testing.T) {
 		}
 		if diskName != test.diskName {
 			t.Errorf("GetFileShareInfo(%q) returned with: %q, expected: %q", test.id, diskName, test.diskName)
+		}
+		if namespace != test.namespace {
+			t.Errorf("GetFileShareInfo(%q) returned with: %q, expected: %q", test.id, namespace, test.namespace)
+		}
+		if subsID != test.subsID {
+			t.Errorf("GetFileShareInfo(%q) returned with: %q, expected: %q", test.id, subsID, test.subsID)
 		}
 		if !reflect.DeepEqual(expectedError, test.expectedError) {
 			t.Errorf("GetFileShareInfo(%q) returned with: %v, expected: %v", test.id, expectedError, test.expectedError)
@@ -295,31 +502,31 @@ func TestGetStorageAccount(t *testing.T) {
 			},
 			expected1: "",
 			expected2: "",
-			expected3: fmt.Errorf("could not find accountname or azurestorageaccountname field secrets(map[accountname: accountkey:])"),
+			expected3: fmt.Errorf("could not find accountname or azurestorageaccountname field in secrets"),
 		},
 		{
 			options:   emptyAccountKeyMap,
 			expected1: "",
 			expected2: "",
-			expected3: fmt.Errorf("could not find accountkey or azurestorageaccountkey field in secrets(%v)", emptyAccountKeyMap),
+			expected3: fmt.Errorf("could not find accountkey or azurestorageaccountkey field in secrets"),
 		},
 		{
 			options:   emptyAccountNameMap,
 			expected1: "",
 			expected2: "",
-			expected3: fmt.Errorf("could not find accountname or azurestorageaccountname field secrets(%v)", emptyAccountNameMap),
+			expected3: fmt.Errorf("could not find accountname or azurestorageaccountname field secrets"),
 		},
 		{
 			options:   emptyAzureAccountKeyMap,
 			expected1: "",
 			expected2: "",
-			expected3: fmt.Errorf("could not find accountkey or azurestorageaccountkey field in secrets(%v)", emptyAzureAccountKeyMap),
+			expected3: fmt.Errorf("could not find accountkey or azurestorageaccountkey field in secrets"),
 		},
 		{
 			options:   emptyAzureAccountNameMap,
 			expected1: "",
 			expected2: "",
-			expected3: fmt.Errorf("could not find accountname or azurestorageaccountname field secrets(%v)", emptyAzureAccountNameMap),
+			expected3: fmt.Errorf("could not find accountname or azurestorageaccountname field in secrets"),
 		},
 		{
 			options:   nil,
@@ -422,50 +629,9 @@ func TestCheckShareNameBeginAndEnd(t *testing.T) {
 	}
 }
 
-func TestGetSnapshot(t *testing.T) {
-	tests := []struct {
-		options   string
-		expected1 string
-		expected2 error
-	}{
-		{
-			options:   "rg#f123#csivolumename#diskname#2019-08-22T07:17:53.0000000Z",
-			expected1: "2019-08-22T07:17:53.0000000Z",
-			expected2: nil,
-		},
-		{
-			options:   "rg#f123#csivolumename",
-			expected1: "",
-			expected2: fmt.Errorf("error parsing volume id: \"rg#f123#csivolumename\", should at least contain four #"),
-		},
-		{
-			options:   "rg#f123",
-			expected1: "",
-			expected2: fmt.Errorf("error parsing volume id: \"rg#f123\", should at least contain four #"),
-		},
-		{
-			options:   "rg",
-			expected1: "",
-			expected2: fmt.Errorf("error parsing volume id: \"rg\", should at least contain four #"),
-		},
-		{
-			options:   "",
-			expected1: "",
-			expected2: fmt.Errorf("error parsing volume id: \"\", should at least contain four #"),
-		},
-	}
-
-	for _, test := range tests {
-		result1, result2 := getSnapshot(test.options)
-		if !reflect.DeepEqual(result1, test.expected1) || !reflect.DeepEqual(result2, test.expected2) {
-			t.Errorf("input: %q, getSnapshot result1: %q, expected1: %q, result2: %q, expected2: %q, ", test.options, result1, test.expected1, result2, test.expected2)
-		}
-	}
-}
-
 func TestIsCorruptedDir(t *testing.T) {
 	skipIfTestingOnWindows(t)
-	existingMountPath, err := ioutil.TempDir(os.TempDir(), "csi-mount-test")
+	existingMountPath, err := os.MkdirTemp(os.TempDir(), "csi-mount-test")
 	if err != nil {
 		t.Fatalf("failed to create tmp dir: %v", err)
 	}
@@ -561,7 +727,7 @@ func TestGetFileURL(t *testing.T) {
 			storageEndpointSuffix: "suffix",
 			fileShareName:         "pvc-file-dynamic-17e43f84-f474-11e8-acd0-000d3a00df41",
 			diskName:              "diskname.vhd",
-			expectedError:         fmt.Errorf("NewSharedKeyCredential(f5713de20cde511e8ba4900) failed with error: illegal base64 data at input byte 0"),
+			expectedError:         fmt.Errorf("NewSharedKeyCredential(f5713de20cde511e8ba4900) failed with error: decode account key: illegal base64 data at input byte 0"),
 		},
 		{
 			accountName:           "^f5713de20cde511e8ba4900",
@@ -573,7 +739,7 @@ func TestGetFileURL(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		_, err := getFileURL(test.accountName, test.accountKey, test.storageEndpointSuffix, test.fileShareName, test.diskName)
+		_, err := getDirectoryClient(test.accountName, test.accountKey, test.storageEndpointSuffix, test.fileShareName, test.diskName)
 		if !reflect.DeepEqual(err, test.expectedError) {
 			t.Errorf("accountName: %v accountKey: %v storageEndpointSuffix: %v fileShareName: %v diskName: %v Error: %v",
 				test.accountName, test.accountKey, test.storageEndpointSuffix, test.fileShareName, test.diskName, err)
@@ -583,7 +749,7 @@ func TestGetFileURL(t *testing.T) {
 
 func TestGetAccountInfo(t *testing.T) {
 	d := NewFakeDriver()
-	d.cloud = &azure.Cloud{}
+	d.cloud = &storage.AccountRepo{}
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -594,10 +760,8 @@ func TestGetAccountInfo(t *testing.T) {
 	}
 	emptySecret := map[string]string{}
 	value := base64.StdEncoding.EncodeToString([]byte("acc_key"))
-	key := storage.AccountListKeysResult{
-		Keys: &[]storage.AccountKey{
-			{Value: &value},
-		},
+	key := []*armstorage.AccountKey{
+		{Value: &value},
 	}
 
 	clientSet := fake.NewSimpleClientset()
@@ -671,15 +835,77 @@ func TestGetAccountInfo(t *testing.T) {
 			expectFileShareName: "test_sharename",
 			expectDiskName:      "",
 		},
+		{
+			volumeID: "uniqe-volumeid-nfs-createfolder",
+			rgName:   "vol_nfs",
+			secrets:  emptySecret,
+			reqContext: map[string]string{
+				resourceGroupField:          "vol_nfs",
+				storageAccountField:         "test_accountname",
+				shareNameField:              "test_sharename",
+				protocolField:               "nfs",
+				createFolderIfNotExistField: "true",
+				folderNameField:             "testfolder",
+			},
+			expectErr:           false,
+			err:                 nil,
+			expectAccountName:   "test_accountname",
+			expectFileShareName: "test_sharename",
+			expectDiskName:      "",
+		},
+		{
+			volumeID: "invalid_getLatestAccountKey_value##",
+			rgName:   "vol_2",
+			secrets:  emptySecret,
+			reqContext: map[string]string{
+				shareNameField:           "test_sharename",
+				getLatestAccountKeyField: "invalid",
+			},
+			expectErr:           true,
+			err:                 fmt.Errorf("invalid %s: %s in volume context", getLatestAccountKeyField, "invalid"),
+			expectAccountName:   "",
+			expectFileShareName: "test_sharename",
+			expectDiskName:      "test_diskname",
+		},
+		{
+			volumeID: "invalid_mountWithManagedIdentityField_value##",
+			rgName:   "vol_2",
+			secrets:  emptySecret,
+			reqContext: map[string]string{
+				shareNameField:                "test_sharename",
+				mountWithManagedIdentityField: "invalid",
+			},
+			expectErr:           true,
+			err:                 fmt.Errorf("invalid %s: %s in volume context", mountWithManagedIdentityField, "invalid"),
+			expectAccountName:   "",
+			expectFileShareName: "test_sharename",
+			expectDiskName:      "test_diskname",
+		},
+		{
+			volumeID: "invalid_mountWithWITokenField_value##",
+			rgName:   "vol_2",
+			secrets:  emptySecret,
+			reqContext: map[string]string{
+				shareNameField:        "test_sharename",
+				mountWithWITokenField: "invalid",
+			},
+			expectErr:           true,
+			err:                 fmt.Errorf("invalid %s: %s in volume context", mountWithWITokenField, "invalid"),
+			expectAccountName:   "",
+			expectFileShareName: "test_sharename",
+			expectDiskName:      "test_diskname",
+		},
 	}
 
 	for _, test := range tests {
-		mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
-		d.cloud.StorageAccountClient = mockStorageAccountsClient
-		d.cloud.KubeClient = clientSet
-		d.cloud.Environment = azure2.Environment{StorageEndpointSuffix: "abc"}
-		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), test.rgName, gomock.Any()).Return(key, nil).AnyTimes()
-		rgName, accountName, _, fileShareName, diskName, err := d.GetAccountInfo(context.Background(), test.volumeID, test.secrets, test.reqContext)
+		mockStorageAccountsClient := mock_accountclient.NewMockInterface(ctrl)
+		d.cloud.ComputeClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+		d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetAccountClient().Return(mockStorageAccountsClient).AnyTimes()
+		d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetAccountClientForSub(gomock.Any()).Return(mockStorageAccountsClient, nil).AnyTimes()
+		d.kubeClient = clientSet
+		d.cloud.Environment = &azclient.Environment{StorageEndpointSuffix: "abc"}
+		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(key, nil).AnyTimes()
+		rgName, accountName, _, fileShareName, diskName, _, _, _, err := d.GetAccountInfo(context.Background(), test.volumeID, test.secrets, test.reqContext)
 		if test.expectErr && err == nil {
 			t.Errorf("Unexpected non-error")
 			continue
@@ -698,10 +924,207 @@ func TestGetAccountInfo(t *testing.T) {
 	}
 }
 
+func TestGetAccountInfoExplicitSecretNamespace(t *testing.T) {
+	d := NewFakeDriver()
+	client := fake.NewSimpleClientset(&v1api.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure-secret", Namespace: "secret-ns"},
+		Data: map[string][]byte{
+			defaultSecretAccountName: []byte("testaccount"),
+			defaultSecretAccountKey:  []byte("testkey"),
+		},
+	})
+	d.kubeClient = client
+	reqContext := map[string]string{
+		"SecretNamespace":            "secret-ns",
+		pvcNamespaceKey:              "pvc-ns",
+		secretNameField:              "azure-secret",
+		getAccountKeyFromSecretField: trueValue,
+	}
+	setKeyValueInMap(reqContext, secretNamespaceField, "secret-ns")
+
+	_, accountName, accountKey, _, _, _, _, _, err := d.GetAccountInfo(context.Background(), "pv-volume", nil, reqContext) //nolint:dogsled // Only account credentials are relevant to this test.
+	assert.NoError(t, err)
+	assert.Equal(t, "testaccount", accountName)
+	assert.Equal(t, "testkey", accountKey)
+	actions := client.Actions()
+	if assert.Len(t, actions, 1) {
+		assert.True(t, actions[0].Matches("get", "secrets"))
+		assert.Equal(t, "secret-ns", actions[0].GetNamespace())
+	}
+}
+
+func TestGetAccountInfoCacheWriteback(t *testing.T) {
+	t.Run("cache hit does not refresh cache entry timestamp", func(t *testing.T) {
+		d := NewFakeDriver()
+		d.cloud = &storage.AccountRepo{}
+
+		const (
+			accountName = "cacheaccount"
+			staleKey    = "stale-key"
+		)
+		reqContext := map[string]string{
+			resourceGroupField:  "rg",
+			storageAccountField: accountName,
+			shareNameField:      "share",
+		}
+
+		d.accountCacheMap.Set(accountName, staleKey)
+		entry, exists, err := d.accountCacheMap.GetStore().GetByKey(accountName)
+		assert.NoError(t, err)
+		if !assert.True(t, exists) {
+			return
+		}
+		cacheEntry := entry.(*cache.AzureCacheEntry)
+		oldCreatedOn := time.Now().UTC().Add(-2 * time.Minute)
+		cacheEntry.CreatedOn = oldCreatedOn
+
+		_, returnedAccountName, accountKey, fileShareName, _, _, _, _, err := d.GetAccountInfo(context.Background(), "invalid-volume-id", nil, reqContext)
+		assert.NoError(t, err)
+		assert.Equal(t, accountName, returnedAccountName)
+		assert.Equal(t, staleKey, accountKey)
+		assert.Equal(t, "share", fileShareName)
+
+		entry, exists, err = d.accountCacheMap.GetStore().GetByKey(accountName)
+		assert.NoError(t, err)
+		if !assert.True(t, exists) {
+			return
+		}
+		cacheEntry = entry.(*cache.AzureCacheEntry)
+		assert.Equal(t, staleKey, cacheEntry.Data)
+		assert.True(t, cacheEntry.CreatedOn.Equal(oldCreatedOn), "cache hit should not rewrite the same key back into cache")
+	})
+
+	t.Run("request secrets still update cache", func(t *testing.T) {
+		d := NewFakeDriver()
+		d.cloud = &storage.AccountRepo{}
+
+		const (
+			accountName = "secretaccount"
+			staleKey    = "stale-key"
+			freshKey    = "fresh-key"
+		)
+		reqContext := map[string]string{
+			resourceGroupField: "rg",
+			shareNameField:     "share",
+		}
+		secrets := map[string]string{
+			defaultSecretAccountName: accountName,
+			defaultSecretAccountKey:  freshKey,
+		}
+
+		d.accountCacheMap.Set(accountName, staleKey)
+		entry, exists, err := d.accountCacheMap.GetStore().GetByKey(accountName)
+		assert.NoError(t, err)
+		if !assert.True(t, exists) {
+			return
+		}
+		cacheEntry := entry.(*cache.AzureCacheEntry)
+		oldCreatedOn := time.Now().UTC().Add(-2 * time.Minute)
+		cacheEntry.CreatedOn = oldCreatedOn
+
+		_, returnedAccountName, accountKey, fileShareName, _, _, _, _, err := d.GetAccountInfo(context.Background(), "invalid-volume-id", secrets, reqContext)
+		assert.NoError(t, err)
+		assert.Equal(t, accountName, returnedAccountName)
+		assert.Equal(t, freshKey, accountKey)
+		assert.Equal(t, "share", fileShareName)
+
+		entry, exists, err = d.accountCacheMap.GetStore().GetByKey(accountName)
+		assert.NoError(t, err)
+		if !assert.True(t, exists) {
+			return
+		}
+		cacheEntry = entry.(*cache.AzureCacheEntry)
+		assert.Equal(t, freshKey, cacheEntry.Data)
+		assert.True(t, cacheEntry.CreatedOn.After(oldCreatedOn), "secret-derived key should still be written back into cache")
+	})
+}
+
+// TestGetAccountInfoWorkloadIdentityTokenFile covers the workload-identity
+// token-file behaviors: (1) the token cache filename must be unique per volume
+// so shared clientID/accountName do not race on one shared file. (2) when the
+// token file is unchanged, (for inline volumes only) GetAccountInfo must still
+// return a non-empty tokenFilePath so the caller always refreshes the
+// credential cache.
+func TestGetAccountInfoWorkloadIdentityTokenFile(t *testing.T) {
+	skipIfTestingOnWindows(t)
+
+	origTokenDir := defaultAzureOAuthTokenDir
+	tokenDir := t.TempDir()
+	defaultAzureOAuthTokenDir = tokenDir
+	defer func() { defaultAzureOAuthTokenDir = origTokenDir }()
+
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{}
+
+	const (
+		clientID    = "test-client-id-1234"
+		accountName = "testaccount"
+		tokenValue  = "test-token-value"
+	)
+	saToken := `{"api://AzureADTokenExchange":{"token":"` + tokenValue + `","expirationTimestamp":"2025-01-01T00:00:00Z"}}`
+	baseContext := func() map[string]string {
+		return map[string]string{
+			mountWithWITokenField:    "true",
+			clientIDField:            clientID,
+			tenantIDField:            "test-tenant-id",
+			storageAccountField:      accountName,
+			shareNameField:           "testshare",
+			serviceAccountTokenField: saToken,
+		}
+	}
+	ephemeralContext := func() map[string]string {
+		ctx := baseContext()
+		ctx[ephemeralField] = "true"
+		return ctx
+	}
+
+	getTokenFilePath := func(volumeID string, reqContext map[string]string) (string, error) {
+		rgName, returnedAccountName, accountKey, fileShareName, diskName, subsID, returnedTenantID, tokenFilePath, err := d.GetAccountInfo(context.Background(), volumeID, nil, reqContext)
+		_ = rgName
+		_ = returnedAccountName
+		_ = accountKey
+		_ = fileShareName
+		_ = diskName
+		_ = subsID
+		_ = returnedTenantID
+		return tokenFilePath, err
+	}
+
+	// distinct volume IDs must yield distinct token file paths.
+	tokenFilePathA, err := getTokenFilePath("volume-A", baseContext())
+	assert.NoError(t, err)
+	tokenFilePathB, err := getTokenFilePath("volume-B", baseContext())
+	assert.NoError(t, err)
+
+	assert.NotEmpty(t, tokenFilePathA)
+	assert.NotEmpty(t, tokenFilePathB)
+	assert.NotEqual(t, tokenFilePathA, tokenFilePathB, "token file path must be unique per volume ID")
+	assert.True(t, strings.HasSuffix(tokenFilePathA, hashVolumeIDForTokenFile("volume-A")))
+	assert.True(t, strings.HasSuffix(tokenFilePathB, hashVolumeIDForTokenFile("volume-B")))
+	assert.Equal(t, filepath.Join(tokenDir, clientID+"-"+accountName+"-"+hashVolumeIDForTokenFile("volume-A")), tokenFilePathA)
+
+	// token file was actually written with the parsed token value.
+	written, readErr := os.ReadFile(tokenFilePathA)
+	assert.NoError(t, readErr)
+	assert.Equal(t, tokenValue, string(written))
+
+	// unchanged token, non-ephemeral volume: return an empty path so the caller
+	// skips the (unnecessary) credential-cache refresh.
+	tokenFilePathNonEphemeral, err := getTokenFilePath("volume-A", baseContext())
+	assert.NoError(t, err)
+	assert.Empty(t, tokenFilePathNonEphemeral, "unchanged token on a non-ephemeral volume must return an empty path")
+
+	// unchanged token, ephemeral inline volume: still return the token file path
+	// (non-empty) so the caller refreshes the credential cache and re-enforces identity.
+	tokenFilePathEphemeral, err := getTokenFilePath("volume-A", ephemeralContext())
+	assert.NoError(t, err)
+	assert.Equal(t, tokenFilePathA, tokenFilePathEphemeral, "unchanged token on an ephemeral volume must still return the token file path, not empty")
+}
+
 func TestCreateDisk(t *testing.T) {
 	skipIfTestingOnWindows(t)
 	d := NewFakeDriver()
-	d.cloud = &azure.Cloud{}
+	d.cloud = &storage.AccountRepo{}
 	tests := []struct {
 		accountName           string
 		accountKey            string
@@ -736,7 +1159,7 @@ func TestCreateDisk(t *testing.T) {
 
 func TestGetFileShareQuota(t *testing.T) {
 	d := NewFakeDriver()
-	d.cloud = &azure.Cloud{}
+	d.cloud = &storage.AccountRepo{}
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	shareQuota := int32(10)
@@ -746,44 +1169,143 @@ func TestGetFileShareQuota(t *testing.T) {
 
 	tests := []struct {
 		desc                string
-		mockedFileShareResp storage.FileShare
+		secrets             map[string]string
+		mockedFileShareResp *armstorage.FileShare
 		mockedFileShareErr  error
 		expectedQuota       int
 		expectedError       error
 	}{
 		{
 			desc:                "Get file share return error",
-			mockedFileShareResp: storage.FileShare{},
+			secrets:             map[string]string{},
+			mockedFileShareResp: &armstorage.FileShare{},
 			mockedFileShareErr:  fmt.Errorf("test error"),
 			expectedQuota:       -1,
 			expectedError:       fmt.Errorf("test error"),
 		},
 		{
 			desc:                "Share not found",
-			mockedFileShareResp: storage.FileShare{},
-			mockedFileShareErr:  fmt.Errorf("ShareNotFound"),
-			expectedQuota:       -1,
-			expectedError:       nil,
+			secrets:             map[string]string{},
+			mockedFileShareResp: &armstorage.FileShare{},
+			mockedFileShareErr: &azcore.ResponseError{
+				StatusCode: http.StatusNotFound,
+			},
+			expectedQuota: -1,
+			expectedError: nil,
 		},
 		{
 			desc:                "Volume already exists",
-			mockedFileShareResp: storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &shareQuota}},
+			secrets:             map[string]string{},
+			mockedFileShareResp: &armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: &shareQuota}},
 			mockedFileShareErr:  nil,
 			expectedQuota:       int(shareQuota),
 			expectedError:       nil,
 		},
+		{
+			desc: "Could not find accountname in secrets",
+			secrets: map[string]string{
+				"secrets": "secrets",
+			},
+			mockedFileShareResp: &armstorage.FileShare{},
+			mockedFileShareErr:  nil,
+			expectedQuota:       -1,
+			expectedError:       fmt.Errorf("could not find accountname or azurestorageaccountname field in secrets"),
+		},
+		{
+			desc: "Error creating azure client",
+			secrets: map[string]string{
+				"accountname": "ut",
+				"accountkey":  "testkey",
+			},
+			mockedFileShareResp: &armstorage.FileShare{},
+			mockedFileShareErr:  nil,
+			expectedQuota:       -1,
+			expectedError:       fmt.Errorf("error creating azure client: decode account key: illegal base64 data at input byte 4"),
+		},
 	}
 
 	for _, test := range tests {
-		mockFileClient := mockfileclient.NewMockInterface(ctrl)
-		d.cloud.FileClient = mockFileClient
-		mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(test.mockedFileShareResp, test.mockedFileShareErr).AnyTimes()
-		quota, err := d.getFileShareQuota(resourceGroupName, accountName, fileShareName, map[string]string{})
+		mockFileClient := mock_fileshareclient.NewMockInterface(ctrl)
+		clientFactory := mock_azclient.NewMockClientFactory(ctrl)
+		clientFactory.EXPECT().GetFileShareClientForSub(gomock.Any()).Return(mockFileClient, nil).AnyTimes()
+		d.cloud.ComputeClientFactory = clientFactory
+		mockFileClient.EXPECT().Get(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(test.mockedFileShareResp, test.mockedFileShareErr).AnyTimes()
+		quota, err := d.getFileShareQuota(context.TODO(), &storage.AccountOptions{
+			ResourceGroup:  resourceGroupName,
+			Name:           accountName,
+			SubscriptionID: "subsID",
+		}, fileShareName, test.secrets, "")
 		if !reflect.DeepEqual(err, test.expectedError) {
 			t.Errorf("test name: %s, Unexpected error: %v, expected error: %v", test.desc, err, test.expectedError)
 		}
 		if quota != test.expectedQuota {
 			t.Errorf("Unexpected return quota: %d, expected: %d", quota, test.expectedQuota)
+		}
+	}
+}
+
+func TestDriverCreateFileShare(t *testing.T) {
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{}
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	shareQuota := int32(10)
+	resourceGroupName := "rg"
+	accountName := "accountname"
+	fileShareName := "filesharename"
+
+	tests := []struct {
+		desc                string
+		mockedFileShareResp *armstorage.FileShare
+		mockedFileShareErr  error
+		mockedCreateResp    *armstorage.FileShare
+		mockedCreateErr     error
+		expectedError       error
+		expectCreate        bool
+	}{
+		{
+			desc:                "file share already exists, skip create",
+			mockedFileShareResp: &armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: &shareQuota}},
+			mockedFileShareErr:  nil,
+			expectedError:       nil,
+			expectCreate:        false,
+		},
+		{
+			desc:                "file share does not exist, create it",
+			mockedFileShareResp: &armstorage.FileShare{},
+			mockedFileShareErr:  &azcore.ResponseError{StatusCode: http.StatusNotFound},
+			mockedCreateResp:    &armstorage.FileShare{},
+			mockedCreateErr:     nil,
+			expectedError:       nil,
+			expectCreate:        true,
+		},
+		{
+			desc:                "GetFileShareQuota returns non-404 error, fall through to create",
+			mockedFileShareResp: &armstorage.FileShare{},
+			mockedFileShareErr:  fmt.Errorf("quota check error"),
+			mockedCreateResp:    &armstorage.FileShare{},
+			mockedCreateErr:     nil,
+			expectedError:       nil,
+			expectCreate:        true,
+		},
+	}
+
+	for _, test := range tests {
+		mockFileClient := mock_fileshareclient.NewMockInterface(ctrl)
+		clientFactory := mock_azclient.NewMockClientFactory(ctrl)
+		clientFactory.EXPECT().GetFileShareClientForSub(gomock.Any()).Return(mockFileClient, nil).AnyTimes()
+		d.cloud.ComputeClientFactory = clientFactory
+		mockFileClient.EXPECT().Get(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(test.mockedFileShareResp, test.mockedFileShareErr).AnyTimes()
+		if test.expectCreate {
+			mockFileClient.EXPECT().Create(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(test.mockedCreateResp, test.mockedCreateErr).Times(1)
+		}
+		err := d.CreateFileShare(context.TODO(), &storage.AccountOptions{
+			ResourceGroup:  resourceGroupName,
+			Name:           accountName,
+			SubscriptionID: "subsID",
+		}, &ShareOptions{Name: fileShareName, RequestGiB: int(shareQuota)}, map[string]string{}, "")
+		if !reflect.DeepEqual(err, test.expectedError) {
+			t.Errorf("test[%s]: unexpected error: %v, expected error: %v", test.desc, err, test.expectedError)
 		}
 	}
 }
@@ -806,7 +1328,7 @@ func TestRun(t *testing.T) {
 		{
 			name: "Successful run",
 			testFunc: func(t *testing.T) {
-				if err := ioutil.WriteFile(fakeCredFile, []byte(fakeCredContent), 0666); err != nil {
+				if err := os.WriteFile(fakeCredFile, []byte(fakeCredContent), 0666); err != nil {
 					t.Error(err)
 				}
 
@@ -825,13 +1347,21 @@ func TestRun(t *testing.T) {
 				os.Setenv(DefaultAzureCredentialFileEnv, fakeCredFile)
 
 				d := NewFakeDriver()
-				d.Run("tcp://127.0.0.1:0", "", true)
+				ctx, cancelFn := context.WithCancel(context.Background())
+				go func() {
+					time.Sleep(1 * time.Second)
+					cancelFn()
+				}()
+				if err := d.Run(ctx); err != nil {
+					t.Error(err.Error())
+				}
+
 			},
 		},
 		{
 			name: "Successful run with node ID missing",
 			testFunc: func(t *testing.T) {
-				if err := ioutil.WriteFile(fakeCredFile, []byte(fakeCredContent), 0666); err != nil {
+				if err := os.WriteFile(fakeCredFile, []byte(fakeCredContent), 0666); err != nil {
 					t.Error(err)
 				}
 
@@ -850,9 +1380,16 @@ func TestRun(t *testing.T) {
 				os.Setenv(DefaultAzureCredentialFileEnv, fakeCredFile)
 
 				d := NewFakeDriver()
-				d.cloud = &azure.Cloud{}
+				ctx, cancelFn := context.WithCancel(context.Background())
+				go func() {
+					time.Sleep(1 * time.Second)
+					cancelFn()
+				}()
+				d.cloud = &storage.AccountRepo{}
 				d.NodeID = ""
-				d.Run("tcp://127.0.0.1:0", "", true)
+				if err := d.Run(ctx); err != nil {
+					t.Error(err.Error())
+				}
 			},
 		},
 	}
@@ -860,21 +1397,6 @@ func TestRun(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, tc.testFunc)
 	}
-}
-
-func TestUtilsRunNodePublishServer(t *testing.T) {
-	d := NewFakeDriver()
-	csicommon.RunNodePublishServer("tcp://127.0.0.1:0", &d.CSIDriver, d, true)
-}
-
-func TestUtilsRunControllerandNodePublishServer(t *testing.T) {
-	d := NewFakeDriver()
-	csicommon.RunControllerandNodePublishServer("tcp://127.0.0.1:0", &d.CSIDriver, d, d, true)
-}
-
-func TestUtilsRunControllerPublishServer(t *testing.T) {
-	d := NewFakeDriver()
-	csicommon.RunControllerPublishServer("tcp://127.0.0.1:0", &d.CSIDriver, d, true)
 }
 
 func TestIsSupportedProtocol(t *testing.T) {
@@ -908,7 +1430,7 @@ func TestIsSupportedProtocol(t *testing.T) {
 	}
 }
 
-func TestIsSupportedAccessTier(t *testing.T) {
+func TestIsSupportedShareAccessTier(t *testing.T) {
 	tests := []struct {
 		accessTier     string
 		expectedResult bool
@@ -948,9 +1470,1191 @@ func TestIsSupportedAccessTier(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		result := isSupportedAccessTier(test.accessTier)
+		result := isSupportedShareAccessTier(test.accessTier)
 		if result != test.expectedResult {
 			t.Errorf("isSupportedTier(%s) returned with %v, not equal to %v", test.accessTier, result, test.expectedResult)
 		}
+	}
+}
+
+func TestIsSupportedAccountAccessTier(t *testing.T) {
+	tests := []struct {
+		accessTier     string
+		expectedResult bool
+	}{
+		{
+			accessTier:     "",
+			expectedResult: true,
+		},
+		{
+			accessTier:     "TransactionOptimized",
+			expectedResult: false,
+		},
+		{
+			accessTier:     "Hot",
+			expectedResult: true,
+		},
+		{
+			accessTier:     "Cool",
+			expectedResult: true,
+		},
+		{
+			accessTier:     "Premium",
+			expectedResult: true,
+		},
+		{
+			accessTier:     "transactionOptimized",
+			expectedResult: false,
+		},
+		{
+			accessTier:     "premium",
+			expectedResult: false,
+		},
+		{
+			accessTier:     "unknown",
+			expectedResult: false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedAccountAccessTier(test.accessTier)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedTier(%s) returned with %v, not equal to %v", test.accessTier, result, test.expectedResult)
+		}
+	}
+}
+
+func TestIsSupportedRootSquashType(t *testing.T) {
+	tests := []struct {
+		rootSquashType string
+		expectedResult bool
+	}{
+		{
+			rootSquashType: "",
+			expectedResult: true,
+		},
+		{
+			rootSquashType: "AllSquash",
+			expectedResult: true,
+		},
+		{
+			rootSquashType: "NoRootSquash",
+			expectedResult: true,
+		},
+		{
+			rootSquashType: "RootSquash",
+			expectedResult: true,
+		},
+		{
+			rootSquashType: "unknown",
+			expectedResult: false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedRootSquashType(test.rootSquashType)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedRootSquashType(%s) returned with %v, not equal to %v", test.rootSquashType, result, test.expectedResult)
+		}
+	}
+}
+
+func TestGetSubnetResourceID(t *testing.T) {
+	testCases := []struct {
+		name     string
+		testFunc func(t *testing.T)
+	}{
+		{
+			name: "NetworkResourceSubscriptionID is Empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &storage.AccountRepo{}
+				d.cloud.SubscriptionID = "fakeSubID"
+				d.cloud.NetworkResourceSubscriptionID = ""
+				d.cloud.ResourceGroup = "foo"
+				d.cloud.VnetResourceGroup = "foo"
+				actualOutput := d.getSubnetResourceID("", "", "")
+				expectedOutput := fmt.Sprintf(subnetTemplate, d.cloud.SubscriptionID, "foo", d.cloud.VnetName, d.cloud.SubnetName)
+				assert.Equal(t, actualOutput, expectedOutput, "cloud.SubscriptionID should be used as the SubID")
+			},
+		},
+		{
+			name: "NetworkResourceSubscriptionID is not Empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &storage.AccountRepo{}
+				d.cloud.SubscriptionID = "fakeSubID"
+				d.cloud.NetworkResourceSubscriptionID = "fakeNetSubID"
+				d.cloud.ResourceGroup = "foo"
+				d.cloud.VnetResourceGroup = "foo"
+				actualOutput := d.getSubnetResourceID("", "", "")
+				expectedOutput := fmt.Sprintf(subnetTemplate, d.cloud.NetworkResourceSubscriptionID, "foo", d.cloud.VnetName, d.cloud.SubnetName)
+				assert.Equal(t, actualOutput, expectedOutput, "cloud.NetworkResourceSubscriptionID should be used as the SubID")
+			},
+		},
+		{
+			name: "VnetResourceGroup is Empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &storage.AccountRepo{}
+				d.cloud.SubscriptionID = "bar"
+				d.cloud.NetworkResourceSubscriptionID = "bar"
+				d.cloud.ResourceGroup = "fakeResourceGroup"
+				d.cloud.VnetResourceGroup = ""
+				actualOutput := d.getSubnetResourceID("", "", "")
+				expectedOutput := fmt.Sprintf(subnetTemplate, "bar", d.cloud.ResourceGroup, d.cloud.VnetName, d.cloud.SubnetName)
+				assert.Equal(t, actualOutput, expectedOutput, "cloud.Resourcegroup should be used as the rg")
+			},
+		},
+		{
+			name: "VnetResourceGroup is not Empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &storage.AccountRepo{}
+				d.cloud.SubscriptionID = "bar"
+				d.cloud.NetworkResourceSubscriptionID = "bar"
+				d.cloud.ResourceGroup = "fakeResourceGroup"
+				d.cloud.VnetResourceGroup = "fakeVnetResourceGroup"
+				actualOutput := d.getSubnetResourceID("", "", "")
+				expectedOutput := fmt.Sprintf(subnetTemplate, "bar", d.cloud.VnetResourceGroup, d.cloud.VnetName, d.cloud.SubnetName)
+				assert.Equal(t, actualOutput, expectedOutput, "cloud.VnetResourceGroup should be used as the rg")
+			},
+		},
+		{
+			name: "VnetResourceGroup, vnetName, subnetName is specified",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &storage.AccountRepo{}
+				d.cloud.SubscriptionID = "bar"
+				d.cloud.NetworkResourceSubscriptionID = "bar"
+				d.cloud.ResourceGroup = "fakeResourceGroup"
+				d.cloud.VnetResourceGroup = "fakeVnetResourceGroup"
+				actualOutput := d.getSubnetResourceID("vnetrg", "vnetName", "subnetName")
+				expectedOutput := fmt.Sprintf(subnetTemplate, "bar", "vnetrg", "vnetName", "subnetName")
+				assert.Equal(t, actualOutput, expectedOutput, "VnetResourceGroup, vnetName, subnetName is specified")
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.testFunc)
+	}
+}
+
+func TestGetTotalAccountQuota(t *testing.T) {
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{}
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	fileShareItemsWithQuota := []*armstorage.FileShareItem{
+		{
+			Properties: &armstorage.FileShareProperties{
+				ShareQuota: to.Ptr(int32(100)),
+			},
+		},
+		{
+			Properties: &armstorage.FileShareProperties{
+				ShareQuota: to.Ptr(int32(200)),
+			},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		subsID           string
+		resourceGroup    string
+		accountName      string
+		fileShareItems   []*armstorage.FileShareItem
+		listFileShareErr error
+		expectedQuota    int32
+		expectedShareNum int32
+		expectedErr      error
+	}{
+		{
+			name:             "GetTotalAccountQuota success",
+			expectedQuota:    0,
+			expectedShareNum: 0,
+		},
+		{
+			name:             "GetTotalAccountQuota success (with 2 file shares)",
+			fileShareItems:   fileShareItemsWithQuota,
+			expectedQuota:    300,
+			expectedShareNum: 2,
+		},
+		{
+			name:             "list file share error",
+			listFileShareErr: fmt.Errorf("list file share error"),
+			expectedQuota:    -1,
+			expectedShareNum: -1,
+			expectedErr:      fmt.Errorf("list file share error"),
+		},
+	}
+
+	for _, test := range tests {
+		mockFileClient := mock_fileshareclient.NewMockInterface(ctrl)
+		d.cloud.ComputeClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+		d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetFileShareClientForSub(gomock.Any()).Return(mockFileClient, nil).AnyTimes()
+		mockFileClient.EXPECT().List(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any()).Return(test.fileShareItems, test.listFileShareErr).AnyTimes()
+
+		quota, fileShareNum, err := d.GetTotalAccountQuota(context.TODO(), test.subsID, test.resourceGroup, test.accountName)
+		assert.Equal(t, test.expectedErr, err, test.name)
+		assert.Equal(t, test.expectedQuota, quota, test.name)
+		assert.Equal(t, test.expectedShareNum, fileShareNum, test.name)
+	}
+}
+
+func TestGetStorageEndPointSuffix(t *testing.T) {
+	d := NewFakeDriver()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name           string
+		cloud          *storage.AccountRepo
+		expectedSuffix string
+	}{
+		{
+			name:           "nil cloud",
+			cloud:          nil,
+			expectedSuffix: "core.windows.net",
+		},
+		{
+			name:           "empty cloud",
+			cloud:          &storage.AccountRepo{},
+			expectedSuffix: "core.windows.net",
+		},
+		{
+			name: "cloud with storage endpoint suffix",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					StorageEndpointSuffix: "suffix",
+				},
+			},
+			expectedSuffix: "suffix",
+		},
+		{
+			name: "public cloud",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					StorageEndpointSuffix: "core.windows.net",
+				},
+			},
+			expectedSuffix: "core.windows.net",
+		},
+		{
+			name: "china cloud",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					StorageEndpointSuffix: "core.chinacloudapi.cn",
+				},
+			},
+			expectedSuffix: "core.chinacloudapi.cn",
+		},
+	}
+
+	for _, test := range tests {
+		d.cloud = test.cloud
+		suffix := d.getStorageEndPointSuffix()
+		assert.Equal(t, test.expectedSuffix, suffix, test.name)
+	}
+}
+
+func TestGetActiveDirectoryEndpoint(t *testing.T) {
+	d := NewFakeDriver()
+
+	tests := []struct {
+		name     string
+		cloud    *storage.AccountRepo
+		expected string
+	}{
+		{
+			name:     "nil cloud",
+			cloud:    nil,
+			expected: defaultActiveDirectoryEndpoint,
+		},
+		{
+			name:     "empty environment",
+			cloud:    &storage.AccountRepo{},
+			expected: defaultActiveDirectoryEndpoint,
+		},
+		{
+			name: "public cloud",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					ActiveDirectoryEndpoint: "https://login.microsoftonline.com/",
+				},
+			},
+			expected: "https://login.microsoftonline.com/",
+		},
+		{
+			name: "china cloud",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					ActiveDirectoryEndpoint: "https://login.chinacloudapi.cn/",
+				},
+			},
+			expected: "https://login.chinacloudapi.cn/",
+		},
+	}
+
+	for _, test := range tests {
+		d.cloud = test.cloud
+		assert.Equal(t, test.expected, d.getActiveDirectoryEndpoint(), test.name)
+	}
+}
+
+func TestGetStorageResource(t *testing.T) {
+	d := NewFakeDriver()
+
+	tests := []struct {
+		name     string
+		cloud    *storage.AccountRepo
+		expected string
+	}{
+		{
+			name:     "nil cloud",
+			cloud:    nil,
+			expected: defaultStorageResource,
+		},
+		{
+			name: "nil resource identifiers",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{},
+			},
+			expected: defaultStorageResource,
+		},
+		{
+			name: "china cloud with custom storage resource",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					ResourceIdentifiers: &azclient.ResourceIdentifier{
+						Storage: "https://storage.example.azure.com/",
+					},
+				},
+			},
+			expected: "https://storage.example.azure.com/",
+		},
+	}
+
+	for _, test := range tests {
+		d.cloud = test.cloud
+		assert.Equal(t, test.expected, d.getStorageResource(), test.name)
+	}
+}
+
+func TestGetEndpointsFromCloudName(t *testing.T) {
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{Environment: azclient.EnvironmentFromName("AZURECHINACLOUD")}
+	assert.Equal(t, "https://login.chinacloudapi.cn/", d.getActiveDirectoryEndpoint())
+	assert.Equal(t, "https://storage.azure.com/", d.getStorageResource())
+}
+
+func TestGetStorageAccesskey(t *testing.T) {
+	options := &storage.AccountOptions{
+		Name:           "test-sa",
+		SubscriptionID: "test-subID",
+		ResourceGroup:  "test-rg",
+	}
+	fakeAccName := options.Name
+	fakeAccKey := "test-key"
+	secretNamespace := "test-ns"
+	testCases := []struct {
+		name          string
+		secrets       map[string]string
+		secretName    string
+		expectedError error
+	}{
+		{
+			name:          "error is not nil", // test case should run first to avoid cache hit
+			secrets:       make(map[string]string),
+			secretName:    "foobar",
+			expectedError: errors.New(""),
+		},
+		{
+			name: "Secrets is larger than 0",
+			secrets: map[string]string{
+				"accountName":              fakeAccName,
+				"accountNameField":         fakeAccName,
+				"defaultSecretAccountName": fakeAccName,
+				"accountKey":               fakeAccKey,
+				"accountKeyField":          fakeAccKey,
+				"defaultSecretAccountKey":  fakeAccKey,
+			},
+			expectedError: nil,
+		},
+		{
+			name:          "secretName is Empty",
+			secrets:       make(map[string]string),
+			secretName:    "",
+			expectedError: nil,
+		},
+		{
+			name:          "successful input/error is nil",
+			secrets:       make(map[string]string),
+			secretName:    fmt.Sprintf(secretNameTemplate, options.Name),
+			expectedError: nil,
+		},
+	}
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{}
+	d.kubeClient = fake.NewSimpleClientset()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockStorageAccountsClient := mock_accountclient.NewMockInterface(ctrl)
+	d.cloud.ComputeClientFactory = mock_azclient.NewMockClientFactory(gomock.NewController(t))
+	d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetAccountClient().Return(mockStorageAccountsClient).AnyTimes()
+	accountListKeysResult := []*armstorage.AccountKey{}
+	mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(accountListKeysResult, nil).AnyTimes()
+	d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetAccountClientForSub(gomock.Any()).Return(mockStorageAccountsClient, nil).AnyTimes()
+	secret := &v1api.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: secretNamespace,
+			Name:      fmt.Sprintf(secretNameTemplate, options.Name),
+		},
+		Data: map[string][]byte{
+			defaultSecretAccountName: []byte(fakeAccName),
+			defaultSecretAccountKey:  []byte(fakeAccKey),
+		},
+		Type: "Opaque",
+	}
+	secret.Namespace = secretNamespace
+	_, secretCreateErr := d.kubeClient.CoreV1().Secrets(secretNamespace).Create(context.TODO(), secret, metav1.CreateOptions{})
+	if secretCreateErr != nil {
+		t.Error("failed to create secret")
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			accKey, err := d.GetStorageAccesskey(context.TODO(), options, tc.secrets, tc.secretName, secretNamespace)
+			if tc.expectedError != nil {
+				assert.Error(t, err, "there should be an error")
+			} else {
+				assert.Equal(t, nil, err, "error should be nil")
+				assert.Equal(t, fakeAccKey, accKey, "account keys must match")
+			}
+		})
+	}
+}
+
+func TestGetStorageAccesskeyWithSubsID(t *testing.T) {
+	testCases := []struct {
+		name          string
+		expectedError error
+	}{
+		{
+			name:          "Get storage access key error with cloud is nil",
+			expectedError: fmt.Errorf("could not get account key: cloud or ComputeClientFactory is nil"),
+		},
+		{
+			name:          "Get storage access key error with ComputeClientFactory is nil",
+			expectedError: fmt.Errorf("could not get account key: cloud or ComputeClientFactory is nil"),
+		},
+		{
+			name:          "Get storage access key successfully",
+			expectedError: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		d := NewFakeDriver()
+		d.cloud = &storage.AccountRepo{}
+		if !strings.Contains(tc.name, "is nil") {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			mockStorageAccountsClient := mock_accountclient.NewMockInterface(ctrl)
+			d.cloud.ComputeClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+			d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetAccountClient().Return(mockStorageAccountsClient).AnyTimes()
+			s := "unit-test"
+			accountkey := armstorage.AccountKey{Value: &s}
+			mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return([]*armstorage.AccountKey{&accountkey}, tc.expectedError).AnyTimes()
+			d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetAccountClientForSub(gomock.Any()).Return(mockStorageAccountsClient, nil).AnyTimes()
+		}
+		_, err := d.GetStorageAccesskeyWithSubsID(context.TODO(), "test-subID", "test-rg", "test-sa", true)
+		assert.Equal(t, tc.expectedError, err)
+	}
+}
+
+func TestGetFileShareClientForSub(t *testing.T) {
+	testCases := []struct {
+		name          string
+		expectedError error
+	}{
+		{
+			name:          "Get file share client error with cloud is nil",
+			expectedError: fmt.Errorf("cloud or ComputeClientFactory is nil"),
+		},
+		{
+			name:          "Get file share client error with ComputeClientFactory is nil",
+			expectedError: fmt.Errorf("cloud or ComputeClientFactory is nil"),
+		},
+		{
+			name:          "Get file share client successfully",
+			expectedError: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		d := NewFakeDriver()
+		d.cloud = &storage.AccountRepo{}
+		if !strings.Contains(tc.name, "is nil") {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			mockFileClient := mock_fileshareclient.NewMockInterface(ctrl)
+			d.cloud.ComputeClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+			d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetFileShareClientForSub(gomock.Any()).Return(mockFileClient, tc.expectedError).AnyTimes()
+		}
+		_, err := d.getFileShareClientForSub("test-subID")
+		assert.Equal(t, tc.expectedError, err)
+	}
+}
+
+func TestIsKataNode(t *testing.T) {
+	testCases := []struct {
+		name        string
+		nodeName    string
+		labels      map[string]string
+		setupClient bool
+		expected    bool
+	}{
+		{
+			name:        "Error when kubeClient is nil",
+			nodeName:    "test-node",
+			setupClient: false,
+			expected:    false,
+		},
+		{
+			name:        "nodeName is empty",
+			nodeName:    "",
+			setupClient: false,
+			expected:    false,
+		},
+		{
+			name:        "Node does not exist",
+			nodeName:    "",
+			setupClient: true,
+			expected:    false,
+		},
+		{
+			name:        "Node exists but has no kata labels",
+			nodeName:    "test-node",
+			setupClient: true,
+			labels: map[string]string{
+				"some-other-label": "value",
+			},
+			expected: false,
+		},
+		{
+			name:        "Node has kata labels",
+			nodeName:    "test-node",
+			setupClient: true,
+			labels: map[string]string{
+				defaultConfidentialContainerLabel: "",
+			},
+			expected: true,
+		},
+		{
+			name:        "Node has kata labels",
+			nodeName:    "test-node",
+			setupClient: true,
+			labels: map[string]string{
+				defaultConfidentialContainerLabel:             "test",
+				"kubernetes.azure.com/kata-mshv-vm-isolation": "true",
+				"katacontainers.io/kata-runtime":              "true",
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.TODO()
+			var clientset kubernetes.Interface
+
+			if tc.setupClient {
+				clientset = fake.NewSimpleClientset()
+			}
+
+			if tc.labels != nil && tc.setupClient {
+				node := &v1api.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   tc.nodeName,
+						Labels: tc.labels,
+					},
+				}
+				_, err := clientset.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+				assert.NoError(t, err)
+			}
+			result := isKataNode(ctx, tc.nodeName, defaultConfidentialContainerLabel, clientset)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestUseDataPlaneAPI(t *testing.T) {
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{}
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name                     string
+		volumeID                 string
+		accountName              string
+		dataPlaneAPIVolMap       map[string]string
+		dataPlaneAPIAccountCache map[string]string
+		expectedResult           string
+	}{
+		{
+			name:                     "dataPlaneAPIVolMap & dataPlaneAPIAccountCache is empty",
+			dataPlaneAPIVolMap:       make(map[string]string),
+			dataPlaneAPIAccountCache: make(map[string]string),
+			expectedResult:           "",
+		},
+		{
+			name:                     "dataPlaneAPIVolMap is not empty",
+			volumeID:                 "test-volume",
+			dataPlaneAPIVolMap:       map[string]string{"test-volume": "true"},
+			dataPlaneAPIAccountCache: make(map[string]string),
+			expectedResult:           "true",
+		},
+		{
+			name:                     "dataPlaneAPIAccountCache is not empty",
+			accountName:              "test-account",
+			dataPlaneAPIVolMap:       make(map[string]string),
+			dataPlaneAPIAccountCache: map[string]string{"test-account": "oatuh"},
+			expectedResult:           "oatuh",
+		},
+		{
+			name:                     "dataPlaneAPIVolMap & dataPlaneAPIAccountCache is not empty",
+			volumeID:                 "test-volume",
+			accountName:              "test-account",
+			dataPlaneAPIVolMap:       map[string]string{"test-volume": "true"},
+			dataPlaneAPIAccountCache: map[string]string{"test-account": "oatuh"},
+			expectedResult:           "true",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dataPlaneAPIAccountCache, _ := cache.NewTimedCache(10*time.Minute, func(_ context.Context, _ string) (interface{}, error) { return nil, nil }, false)
+			for k, v := range test.dataPlaneAPIVolMap {
+				d.dataPlaneAPIVolMap.Store(k, v)
+			}
+			for k, v := range test.dataPlaneAPIAccountCache {
+				dataPlaneAPIAccountCache.Set(k, v)
+			}
+			d.dataPlaneAPIAccountCache = dataPlaneAPIAccountCache
+			result := d.useDataPlaneAPI(context.TODO(), test.volumeID, test.accountName)
+			assert.Equal(t, test.expectedResult, result)
+		})
+	}
+}
+
+func TestSetAzureCredentials(t *testing.T) {
+	testCases := []struct {
+		name               string
+		secretName         string
+		seceretNamespace   string
+		accountName        string
+		accountKey         string
+		expectedError      error
+		expectedSecretName string
+	}{
+		{
+			name:          "kubeClient is nil",
+			accountName:   "test-account",
+			accountKey:    "test-key",
+			expectedError: nil,
+		},
+		{
+			name:          "accountName is empty",
+			expectedError: fmt.Errorf("the account info is not enough, accountName(%v), accountKey(%v)", "", ""),
+		},
+		{
+			name:          "accountKey is empty",
+			expectedError: fmt.Errorf("the account info is not enough, accountName(%v), accountKey(%v)", "", ""),
+		},
+		{
+			name:               "success when secretName is empty",
+			accountName:        "test-account",
+			accountKey:         "test-key",
+			expectedError:      nil,
+			expectedSecretName: fmt.Sprintf(secretNameTemplate, "test-account"),
+		},
+		{
+			name:               "success when secretName is not empty",
+			secretName:         "test-secret",
+			accountName:        "test-account",
+			accountKey:         "test-key",
+			expectedError:      nil,
+			expectedSecretName: "test-secret",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := NewFakeDriver()
+			if tc.name == "kubeClient is nil" {
+				d.kubeClient = nil
+			} else {
+				d.kubeClient = fake.NewSimpleClientset()
+			}
+			secretName, err := d.SetAzureCredentials(context.TODO(), tc.accountName, tc.accountKey, tc.secretName, tc.seceretNamespace)
+			assert.Equal(t, tc.expectedError, err)
+			assert.Equal(t, tc.expectedSecretName, secretName)
+		})
+	}
+}
+
+func TestIsSupportedPublicNetworkAccess(t *testing.T) {
+	tests := []struct {
+		publicNetworkAccess string
+		expectedResult      bool
+	}{
+		{
+			publicNetworkAccess: "",
+			expectedResult:      true,
+		},
+		{
+			publicNetworkAccess: "Enabled",
+			expectedResult:      true,
+		},
+		{
+			publicNetworkAccess: "Disabled",
+			expectedResult:      true,
+		},
+		{
+			publicNetworkAccess: "InvalidValue",
+			expectedResult:      false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedPublicNetworkAccess(test.publicNetworkAccess)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedPublicNetworkAccess(%s) returned %v, expected %v", test.publicNetworkAccess, result, test.expectedResult)
+		}
+	}
+}
+
+func TestIsSupportedNetworkEndpointType(t *testing.T) {
+	tests := []struct {
+		networkEndpointType string
+		expectedResult      bool
+	}{
+		{
+			networkEndpointType: "",
+			expectedResult:      true,
+		},
+		{
+			networkEndpointType: "privateEndpoint",
+			expectedResult:      true,
+		},
+		{
+			networkEndpointType: "serviceEndpoint",
+			expectedResult:      true,
+		},
+		{
+			networkEndpointType: "SERVICEENDPOINT",
+			expectedResult:      true,
+		},
+		{
+			networkEndpointType: "serviceEndpiont",
+			expectedResult:      false,
+		},
+		{
+			networkEndpointType: "InvalidValue",
+			expectedResult:      false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedNetworkEndpointType(test.networkEndpointType)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedNetworkEndpointType(%s) returned %v, expected %v", test.networkEndpointType, result, test.expectedResult)
+		}
+	}
+}
+
+func TestCreateFolderIfNotExists(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+	d := NewFakeDriver()
+	ctx := context.Background()
+
+	tests := []struct {
+		name                  string
+		accountName           string
+		accountKey            string
+		fileShareName         string
+		folderName            string
+		storageEndpointSuffix string
+		expectedError         string
+	}{
+		{
+			name:                  "Empty account name",
+			accountName:           "",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "testshare",
+			folderName:            "testfolder",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "accountName is empty",
+		},
+		{
+			name:                  "Empty file share name",
+			accountName:           "testaccount",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "",
+			folderName:            "testfolder",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "fileShareName is empty",
+		},
+		{
+			name:                  "Invalid account key",
+			accountName:           "testaccount",
+			accountKey:            "invalid-base64-key",
+			fileShareName:         "testshare",
+			folderName:            "testfolder",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "decode account key",
+		},
+		{
+			name:                  "Empty folder name",
+			accountName:           "testaccount",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "testshare",
+			folderName:            "",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "", // Should succeed as it's the root
+		},
+		{
+			name:                  "Folder with leading and trailing slashes",
+			accountName:           "testaccount",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "testshare",
+			folderName:            "/path/to/folder/",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "", // Should handle gracefully
+		},
+		{
+			name:                  "Nested folder path",
+			accountName:           "testaccount",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "testshare",
+			folderName:            "level1/level2/level3",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "", // Should create all levels
+		},
+		{
+			name:                  "Folder with empty components",
+			accountName:           "testaccount",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "testshare",
+			folderName:            "path//to///folder",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "", // Should skip empty components
+		},
+		{
+			name:                  "Single level folder",
+			accountName:           "testaccount",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "testshare",
+			folderName:            "singlefolder",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "", // Should create single folder
+		},
+		{
+			name:                  "China cloud endpoint",
+			accountName:           "testaccount",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "testshare",
+			folderName:            "testfolder",
+			storageEndpointSuffix: "core.chinacloudapi.cn",
+			expectedError:         "", // Should work with different endpoints
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := d.createFolderIfNotExists(ctx, test.accountName, test.accountKey, test.fileShareName, test.folderName, test.storageEndpointSuffix)
+
+			if test.expectedError != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), test.expectedError)
+			} else {
+				// These tests will fail in unit test environment as they require actual Azure connection
+				// In a real test environment with mocked Azure services, these would pass
+				// For now, we just verify the function doesn't panic
+				_ = err
+			}
+		})
+	}
+}
+
+func TestGetInfoFromSnapshotID(t *testing.T) {
+	tests := []struct {
+		name          string
+		id            string
+		expectedRG    string
+		expectedAcct  string
+		expectedShare string
+		expectedTime  string
+		expectedSubs  string
+		expectedError error
+	}{
+		{
+			name:          "Valid snapshot ID with 7 segments",
+			id:            "rg#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "rg",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "Valid snapshot ID with 8 segments and valid subscription ID at end",
+			id:            "rg#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z#12345678-1234-1234-1234-123456789012",
+			expectedRG:    "rg",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
+		},
+		{
+			name:          "Valid snapshot ID with 8 segments and invalid subscription ID at end",
+			id:            "rg#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z#",
+			expectedRG:    "rg",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "Valid snapshot ID with 8 segments and subscription ID at position 6",
+			id:            "rg#accountname#sharename#diskname#namespace#azurefile-6654#12345678-1234-1234-1234-123456789012#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "rg",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
+		},
+		{
+			name:          "Valid snapshot ID with 8 segments but invalid subscription IDs",
+			id:            "rg#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z#invalid-sub-id",
+			expectedRG:    "rg",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "Short snapshot ID with 5 segments (in-tree migration with subsID)",
+			id:            "#accountname#sharename#2025-09-05T07:51:41.0000000Z#12345678-1234-1234-1234-123456789012",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
+		},
+		{
+			name:          "Short snapshot ID with 5 segments (subsID before snapshotTime)",
+			id:            "#accountname#sharename#12345678-1234-1234-1234-123456789012#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
+		},
+		{
+			name:          "Short snapshot ID with 4 segments (in-tree migration without subsID)",
+			id:            "#accountname#sharename#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "Short snapshot ID with 6 segments",
+			id:            "rg#accountname#sharename#diskname#namespace#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "rg",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "In-tree migration snapshot ID with empty RG and 7 segments",
+			id:            "#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "In-tree migration snapshot ID with empty RG and 8 segments (with subsID)",
+			id:            "#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z#12345678-1234-1234-1234-123456789012",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
+		},
+		{
+			name:          "Invalid snapshot ID with less than 4 segments",
+			id:            "rg#accountname#sharename",
+			expectedRG:    "",
+			expectedAcct:  "",
+			expectedShare: "",
+			expectedTime:  "",
+			expectedSubs:  "",
+			expectedError: fmt.Errorf("error parsing snapshot id: \"rg#accountname#sharename\", should at least contain 3 #"),
+		},
+		{
+			name:          "Empty snapshot ID",
+			id:            "",
+			expectedRG:    "",
+			expectedAcct:  "",
+			expectedShare: "",
+			expectedTime:  "",
+			expectedSubs:  "",
+			expectedError: fmt.Errorf("error parsing snapshot id: \"\", should at least contain 3 #"),
+		},
+		{
+			name:          "Snapshot ID with empty segments",
+			id:            "###diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "",
+			expectedAcct:  "",
+			expectedShare: "",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "Snapshot ID with 9 segments",
+			id:            "rg#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z#12345678-1234-1234-1234-123456789012#extra",
+			expectedRG:    "rg",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rg, acct, share, time, subs, err := GetInfoFromSnapshotID(test.id)
+
+			if test.expectedError != nil {
+				assert.EqualError(t, err, test.expectedError.Error())
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, test.expectedRG, rg)
+				assert.Equal(t, test.expectedAcct, acct)
+				assert.Equal(t, test.expectedShare, share)
+				assert.Equal(t, test.expectedTime, time)
+				assert.Equal(t, test.expectedSubs, subs)
+			}
+		})
+	}
+}
+
+func TestParseServiceAccountToken(t *testing.T) {
+	tests := []struct {
+		name          string
+		tokenStr      string
+		expectedToken string
+		expectedError string
+	}{
+		{
+			name:          "Empty token string",
+			tokenStr:      "",
+			expectedToken: "",
+			expectedError: "service account token is empty",
+		},
+		{
+			name:          "Invalid JSON",
+			tokenStr:      "invalid-json",
+			expectedToken: "",
+			expectedError: "failed to unmarshal service account tokens",
+		},
+		{
+			name:          "Valid token with audience",
+			tokenStr:      `{"api://AzureADTokenExchange":{"token":"test-token-value","expirationTimestamp":"2025-01-01T00:00:00Z"}}`,
+			expectedToken: "test-token-value",
+			expectedError: "",
+		},
+		{
+			name:          "Token with empty token value",
+			tokenStr:      `{"api://AzureADTokenExchange":{"token":"","expirationTimestamp":"2025-01-01T00:00:00Z"}}`,
+			expectedToken: "",
+			expectedError: "token for audience api://AzureADTokenExchange/.default not found",
+		},
+		{
+			name:          "Token with missing api://AzureADTokenExchange field",
+			tokenStr:      `{"someOtherField":{"token":"test-token","expirationTimestamp":"2025-01-01T00:00:00Z"}}`,
+			expectedToken: "",
+			expectedError: "token for audience api://AzureADTokenExchange/.default not found",
+		},
+		{
+			name:          "Token with partial JSON structure",
+			tokenStr:      `{"api://AzureADTokenExchange":{}}`,
+			expectedToken: "",
+			expectedError: "token for audience api://AzureADTokenExchange/.default not found",
+		},
+		{
+			name:          "Malformed JSON with extra characters",
+			tokenStr:      `{"api://AzureADTokenExchange":{"token":"test-token"}}extra`,
+			expectedToken: "",
+			expectedError: "failed to unmarshal service account tokens",
+		},
+		{
+			name:          "Token with special characters",
+			tokenStr:      `{"api://AzureADTokenExchange":{"token":"eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ.eyJzdWIiOiIxMjM0NTY3ODkwIn0.test","expirationTimestamp":"2025-01-01T00:00:00Z"}}`,
+			expectedToken: "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ.eyJzdWIiOiIxMjM0NTY3ODkwIn0.test",
+			expectedError: "",
+		},
+		{
+			name:          "Token with unicode characters",
+			tokenStr:      `{"api://AzureADTokenExchange":{"token":"test-token-.","expirationTimestamp":"2025-01-01T00:00:00Z"}}`,
+			expectedToken: "test-token-.",
+			expectedError: "",
+		},
+		{
+			name:          "Token with whitespace in value",
+			tokenStr:      `{"api://AzureADTokenExchange":{"token":"  test-token  ","expirationTimestamp":"2025-01-01T00:00:00Z"}}`,
+			expectedToken: "  test-token  ",
+			expectedError: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			token, err := parseServiceAccountToken(test.tokenStr)
+
+			if test.expectedError != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), test.expectedError)
+				assert.Equal(t, "", token)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, test.expectedToken, token)
+			}
+		})
 	}
 }

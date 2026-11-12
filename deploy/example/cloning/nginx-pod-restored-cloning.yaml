@@ -1,0 +1,22 @@
+---
+kind: Pod
+apiVersion: v1
+metadata:
+  name: nginx-azurefile-restored-cloning
+spec:
+  nodeSelector:
+    kubernetes.io/os: linux
+  containers:
+    - image: mcr.microsoft.com/mirror/docker/library/nginx:1.23
+      name: nginx-azurefile-restored-cloning
+      args:
+        - sleep
+        - "3600"
+      volumeMounts:
+        - name: azurefile-cloning
+          mountPath: "/mnt/azurefile"
+          readOnly: false
+  volumes:
+    - name: azurefile-cloning
+      persistentVolumeClaim:
+        claimName: pvc-azurefile-cloning

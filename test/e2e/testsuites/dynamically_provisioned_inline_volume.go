@@ -17,9 +17,11 @@ limitations under the License.
 package testsuites
 
 import (
+	"context"
+
 	"sigs.k8s.io/azurefile-csi-driver/test/e2e/driver"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 )
@@ -37,14 +39,14 @@ type DynamicallyProvisionedInlineVolumeTest struct {
 	CSIInlineVolume bool
 }
 
-func (t *DynamicallyProvisionedInlineVolumeTest) Run(client clientset.Interface, namespace *v1.Namespace) {
+func (t *DynamicallyProvisionedInlineVolumeTest) Run(ctx context.Context, client clientset.Interface, namespace *v1.Namespace) {
 	for _, pod := range t.Pods {
 		var tpod *TestPod
 		var cleanup []func()
 		if t.CSIInlineVolume {
-			tpod, cleanup = pod.SetupWithCSIInlineVolumes(client, namespace, t.CSIDriver, t.SecretName, t.ShareName, t.Server, t.ReadOnly)
+			tpod, cleanup = pod.SetupWithCSIInlineVolumes(client, namespace, t.SecretName, t.ShareName, t.Server, t.ReadOnly)
 		} else {
-			tpod, cleanup = pod.SetupWithInlineVolumes(client, namespace, t.CSIDriver, t.SecretName, t.ShareName, t.ReadOnly)
+			tpod, cleanup = pod.SetupWithInlineVolumes(client, namespace, t.SecretName, t.ShareName, t.ReadOnly)
 		}
 
 		// defer must be called here for resources not get removed before using them
@@ -53,9 +55,9 @@ func (t *DynamicallyProvisionedInlineVolumeTest) Run(client clientset.Interface,
 		}
 
 		ginkgo.By("deploying the pod")
-		tpod.Create()
-		defer tpod.Cleanup()
+		tpod.Create(ctx)
+		defer tpod.Cleanup(ctx)
 		ginkgo.By("checking that the pods command exits with no error")
-		tpod.WaitForSuccess()
+		tpod.WaitForSuccess(ctx)
 	}
 }

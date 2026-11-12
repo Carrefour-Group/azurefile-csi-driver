@@ -7,7 +7,7 @@ spec:
   nodeSelector:
     "kubernetes.io/os": linux
   containers:
-    - image: mcr.microsoft.com/oss/nginx/nginx:1.19.5
+    - image: mcr.microsoft.com/mirror/docker/library/nginx:1.23
       name: nginx-azurefile
       command:
         - "/bin/bash"
@@ -16,6 +16,7 @@ spec:
       volumeMounts:
         - name: persistent-storage
           mountPath: "/mnt/azurefile"
+          readOnly: false
   volumes:
     - name: persistent-storage
       csi:
@@ -23,4 +24,4 @@ spec:
         volumeAttributes:
           shareName: EXISTING_SHARE_NAME  # required
           secretName: azure-secret  # required
-          mountOptions: "dir_mode=0777,file_mode=0777,cache=strict,actimeo=30"  # optional
+          mountOptions: "dir_mode=0777,file_mode=0777,cache=strict,actimeo=30,nosharesock"  # optional

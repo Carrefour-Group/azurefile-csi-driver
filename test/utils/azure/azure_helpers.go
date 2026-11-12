@@ -18,71 +18,117 @@ package azure
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"sort"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-12-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2020-07-01/network"
-	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2018-05-01/resources"
-	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2019-06-01/storage"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/adal"
-	"github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	armauthorization "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
+	armcompute "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	armmsi "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
+	resources "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+	storage "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage/v2"
+	"github.com/google/uuid"
+	"sigs.k8s.io/azurefile-csi-driver/pkg/azurefile"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/fileshareclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/resourcegroupclient"
 )
 
 type Client struct {
-	environment         azure.Environment
-	subscriptionID      string
-	groupsClient        resources.GroupsClient
-	vmClient            compute.VirtualMachinesClient
-	nicClient           network.InterfacesClient
-	subnetsClient       network.SubnetsClient
-	vnetClient          network.VirtualNetworksClient
-	accountsClient      storage.AccountsClient
-	filesharesClient    storage.FileSharesClient
-	sshPublicKeysClient compute.SSHPublicKeysClient
+	subscriptionID   string
+	groupsClient     resourcegroupclient.Interface
+	accountsClient   accountclient.Interface
+	filesharesClient fileshareclient.Interface
+	vmssClient       *armcompute.VirtualMachineScaleSetsClient
+	vmClient         *armcompute.VirtualMachinesClient
+	roleClient       *armauthorization.RoleAssignmentsClient
+	ficClient        *armmsi.FederatedIdentityCredentialsClient
+	uamiClient       *armmsi.UserAssignedIdentitiesClient
 }
 
-func GetAzureClient(cloud, subscriptionID, clientID, tenantID, clientSecret string) (*Client, error) {
-	env, err := azure.EnvironmentFromName(cloud)
+func GetAzureClient(cloud, subscriptionID, clientID, tenantID, clientSecret, aadFederatedTokenFile string) (*Client, error) {
+	armConfig := &azclient.ARMClientConfig{
+		Cloud:     cloud,
+		TenantID:  tenantID,
+		UserAgent: azurefile.GetUserAgent(azurefile.DefaultDriverName, "", "e2e-test"),
+	}
+	clientOps, _, err := azclient.GetAzureCloudConfigAndEnvConfig(armConfig)
+	if err != nil {
+		return nil, err
+	}
+	useFederatedWorkloadIdentityExtension := false
+	if aadFederatedTokenFile != "" {
+		useFederatedWorkloadIdentityExtension = true
+	}
+	credProvider, err := azclient.NewAuthProvider(armConfig, &azclient.AzureAuthConfig{
+		AADClientID:                           clientID,
+		AADClientSecret:                       clientSecret,
+		AADFederatedTokenFile:                 aadFederatedTokenFile,
+		UseFederatedWorkloadIdentityExtension: useFederatedWorkloadIdentityExtension,
+	})
+	if err != nil {
+		return nil, err
+	}
+	cred := credProvider.GetAzIdentity()
+	factory, err := azclient.NewClientFactory(&azclient.ClientFactoryConfig{
+		SubscriptionID: subscriptionID,
+	}, armConfig, clientOps, cred)
 	if err != nil {
 		return nil, err
 	}
 
-	oauthConfig, err := getOAuthConfig(env, subscriptionID, tenantID)
+	armClientOpts, err := azclient.GetDefaultResourceClientOption(armConfig)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get default ARM client options: %v", err)
+	}
+	armClientOpts.Cloud = clientOps
+
+	vmssClient, err := armcompute.NewVirtualMachineScaleSetsClient(subscriptionID, cred, armClientOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VMSS client: %v", err)
+	}
+	vmClient, err := armcompute.NewVirtualMachinesClient(subscriptionID, cred, armClientOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VM client: %v", err)
+	}
+	roleClient, err := armauthorization.NewRoleAssignmentsClient(subscriptionID, cred, armClientOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create role assignments client: %v", err)
+	}
+	uamiClient, err := armmsi.NewUserAssignedIdentitiesClient(subscriptionID, cred, armClientOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user assigned identities client: %v", err)
+	}
+	ficClient, err := armmsi.NewFederatedIdentityCredentialsClient(subscriptionID, cred, armClientOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create federated identity credentials client: %v", err)
 	}
 
-	armSpt, err := adal.NewServicePrincipalToken(*oauthConfig, clientID, clientSecret, env.ServiceManagementEndpoint)
-	if err != nil {
-		return nil, err
-	}
-
-	return getClient(env, subscriptionID, tenantID, armSpt), nil
+	return &Client{
+		subscriptionID:   subscriptionID,
+		groupsClient:     factory.GetResourceGroupClient(),
+		accountsClient:   factory.GetAccountClient(),
+		filesharesClient: factory.GetFileShareClient(),
+		vmssClient:       vmssClient,
+		vmClient:         vmClient,
+		roleClient:       roleClient,
+		ficClient:        ficClient,
+		uamiClient:       uamiClient,
+	}, nil
 }
 
-func (az *Client) GetAzureFilesClient() (storage.FileSharesClient, error) {
-
+func (az *Client) GetAzureFilesClient() (fileshareclient.Interface, error) {
 	return az.filesharesClient, nil
 }
 
-func (az *Client) EnsureSSHPublicKey(ctx context.Context, subscriptionID, resourceGroupName, location, keyName string) (publicKey string, err error) {
-	_, err = az.sshPublicKeysClient.Create(ctx, resourceGroupName, keyName, compute.SSHPublicKeyResource{Location: &location})
-	if err != nil {
-		return "", err
-	}
-	result, err := az.sshPublicKeysClient.GenerateKeyPair(ctx, resourceGroupName, keyName)
-	if err != nil {
-		return "", err
-	}
-	return *result.PublicKey, nil
-}
-
-func (az *Client) EnsureResourceGroup(ctx context.Context, name, location string, managedBy *string) (resourceGroup *resources.Group, err error) {
+func (az *Client) EnsureResourceGroup(ctx context.Context, name, location string, managedBy *string) (resourceGroup *resources.ResourceGroup, err error) {
 	var tags map[string]*string
 	group, err := az.groupsClient.Get(ctx, name)
 	if err == nil && group.Tags != nil {
@@ -90,234 +136,312 @@ func (az *Client) EnsureResourceGroup(ctx context.Context, name, location string
 	} else {
 		tags = make(map[string]*string)
 	}
+	// Clearing managedBy on an AKS node resource group fails with ResourceGroupManagedByMismatch.
+	if managedBy == nil && err == nil && group.ManagedBy != nil {
+		managedBy = group.ManagedBy
+	}
 	// Tags for correlating resource groups with prow jobs on testgrid
 	tags["buildID"] = stringPointer(os.Getenv("BUILD_ID"))
 	tags["jobName"] = stringPointer(os.Getenv("JOB_NAME"))
 	tags["creationTimestamp"] = stringPointer(time.Now().UTC().Format(time.RFC3339))
 
-	response, err := az.groupsClient.CreateOrUpdate(ctx, name, resources.Group{
+	response, err := az.groupsClient.CreateOrUpdate(ctx, name, resources.ResourceGroup{
 		Name:      &name,
 		Location:  &location,
 		ManagedBy: managedBy,
 		Tags:      tags,
 	})
 	if err != nil {
-		return &response, err
+		return response, err
 	}
 
-	return &response, nil
+	return response, nil
 }
 
-func (az *Client) DeleteResourceGroup(ctx context.Context, groupName string, waitForCompletion bool) error {
+func (az *Client) DeleteResourceGroup(ctx context.Context, groupName string) error {
 	_, err := az.groupsClient.Get(ctx, groupName)
-	if err == nil {
-		future, err := az.groupsClient.Delete(ctx, groupName)
+	if err != nil {
+		return err
+	}
+
+	timeout := 20 * time.Minute
+	ch := make(chan bool, 1)
+
+	go func() {
+		err = az.groupsClient.Delete(ctx, groupName)
+		ch <- true
+	}()
+
+	select {
+	case <-ch:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("timeout waiting for resource group %s to be deleted", groupName)
+	}
+}
+
+func (az *Client) GetStorageAccount(ctx context.Context, groupName, accountName string) (*storage.Account, error) {
+	return az.accountsClient.GetProperties(ctx, groupName, accountName, nil)
+}
+
+func (az *Client) GetAccountNumByResourceGroup(ctx context.Context, groupName string) (count int, err error) {
+	result, err := az.accountsClient.List(ctx, groupName)
+	if err != nil {
+		return -1, err
+	}
+	return len(result), nil
+}
+
+func stringPointer(s string) *string {
+	return &s
+}
+
+// GetNodeIdentityPrincipalIDs retrieves the principal IDs of managed identities from VMSS and VMs in the resource group.
+// Supports both system-assigned and user-assigned managed identities.
+// This works for both CAPZ and AKS clusters regardless of whether they use VMSS or availability set VMs.
+func (az *Client) GetNodeIdentityPrincipalIDs(ctx context.Context, resourceGroup string) ([]string, error) {
+	var principalIDs []string
+
+	// Check VMSS
+	log.Printf("Listing VMSS in resource group %s ...", resourceGroup)
+	vmssPager := az.vmssClient.NewListPager(resourceGroup, nil)
+	for vmssPager.More() {
+		page, err := vmssPager.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("cannot delete resource group %v: %v", groupName, err)
+			return nil, fmt.Errorf("failed to list VMSS in resource group %s: %v", resourceGroup, err)
 		}
-		if waitForCompletion {
-			err = future.WaitForCompletionRef(ctx, az.groupsClient.Client)
-			if err != nil {
-				// Skip the teardown errors because of https://github.com/Azure/go-autorest/issues/357
-				// TODO(feiskyer): fix the issue by upgrading go-autorest version >= v11.3.2.
-				log.Printf("Warning: failed to delete resource group %q with error %v", groupName, err)
+		for _, vmss := range page.Value {
+			name := ""
+			if vmss.Name != nil {
+				name = *vmss.Name
+			}
+			if vmss.Identity == nil {
+				log.Printf("VMSS %s has no managed identity, skipping", name)
+				continue
+			}
+			// System-assigned identity
+			if vmss.Identity.PrincipalID != nil && *vmss.Identity.PrincipalID != "" {
+				log.Printf("VMSS %s: found system-assigned identity, principalID=%s", name, *vmss.Identity.PrincipalID)
+				principalIDs = append(principalIDs, *vmss.Identity.PrincipalID)
+			}
+			// User-assigned identities
+			for uaID, uaIdentity := range vmss.Identity.UserAssignedIdentities {
+				if uaIdentity != nil && uaIdentity.PrincipalID != nil && *uaIdentity.PrincipalID != "" {
+					clientID := ""
+					if uaIdentity.ClientID != nil {
+						clientID = *uaIdentity.ClientID
+					}
+					log.Printf("VMSS %s: found user-assigned identity %s, principalID=%s, clientID=%s", name, uaID, *uaIdentity.PrincipalID, clientID)
+					principalIDs = append(principalIDs, *uaIdentity.PrincipalID)
+				}
+			}
+		}
+	}
+
+	// Check individual VMs (availability set scenario)
+	log.Printf("Listing VMs in resource group %s ...", resourceGroup)
+	vmPager := az.vmClient.NewListPager(resourceGroup, nil)
+	for vmPager.More() {
+		page, err := vmPager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list VMs in resource group %s: %v", resourceGroup, err)
+		}
+		for _, vm := range page.Value {
+			name := ""
+			if vm.Name != nil {
+				name = *vm.Name
+			}
+			if vm.Identity == nil {
+				log.Printf("VM %s has no managed identity, skipping", name)
+				continue
+			}
+			// System-assigned identity
+			if vm.Identity.PrincipalID != nil && *vm.Identity.PrincipalID != "" {
+				log.Printf("VM %s: found system-assigned identity, principalID=%s", name, *vm.Identity.PrincipalID)
+				principalIDs = append(principalIDs, *vm.Identity.PrincipalID)
+			}
+			// User-assigned identities
+			for uaID, uaIdentity := range vm.Identity.UserAssignedIdentities {
+				if uaIdentity != nil && uaIdentity.PrincipalID != nil && *uaIdentity.PrincipalID != "" {
+					clientID := ""
+					if uaIdentity.ClientID != nil {
+						clientID = *uaIdentity.ClientID
+					}
+					log.Printf("VM %s: found user-assigned identity %s, principalID=%s, clientID=%s", name, uaID, *uaIdentity.PrincipalID, clientID)
+					principalIDs = append(principalIDs, *uaIdentity.PrincipalID)
+				}
+			}
+		}
+	}
+
+	if len(principalIDs) == 0 {
+		return nil, fmt.Errorf("no VMSS or VM with managed identity found in resource group %s", resourceGroup)
+	}
+
+	// Deduplicate
+	seen := make(map[string]bool)
+	unique := principalIDs[:0]
+	for _, id := range principalIDs {
+		if !seen[id] {
+			seen[id] = true
+			unique = append(unique, id)
+		}
+	}
+	log.Printf("Found %d unique principal IDs in resource group %s", len(unique), resourceGroup)
+	return unique, nil
+}
+
+// AssignRoleToIdentity assigns an Azure role to a principal on a resource group scope.
+// roleDefinitionID should be just the GUID of the role definition.
+// Common roles:
+//   - Storage File Data Privileged Contributor: 69566ab7-960f-475b-8e7c-b3118f30c6bd
+//   - Storage File Data SMB MI Admin: a235d3ee-5935-4cfb-8cc5-a3303ad5995e
+func (az *Client) AssignRoleToIdentity(ctx context.Context, resourceGroup, principalID, roleDefinitionID string) error {
+	scope := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s", az.subscriptionID, resourceGroup)
+	fullRoleDefID := fmt.Sprintf("/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/%s", az.subscriptionID, roleDefinitionID)
+
+	// Deterministic assignment ID based on scope+principal+role to avoid duplicate assignments on retry
+	assignmentID := uuid.NewSHA1(uuid.NameSpaceURL, []byte(scope+"|"+principalID+"|"+roleDefinitionID)).String()
+
+	_, err := az.roleClient.Create(ctx, scope, assignmentID, armauthorization.RoleAssignmentCreateParameters{
+		Properties: &armauthorization.RoleAssignmentProperties{
+			PrincipalID:      &principalID,
+			PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
+			RoleDefinitionID: &fullRoleDefID,
+		},
+	}, nil)
+	if err != nil {
+		// Ignore conflict only when role assignment already exists
+		var respErr *azcore.ResponseError
+		if ok := errors.As(err, &respErr); ok && respErr.StatusCode == http.StatusConflict && respErr.ErrorCode == "RoleAssignmentExists" {
+			return nil
+		}
+		return fmt.Errorf("failed to create role assignment for principal %s with role %s on scope %s: %v", principalID, roleDefinitionID, scope, err)
+	}
+	return nil
+}
+
+// EnsureNodeStorageFileDataRole gets the node identities from VMSS and VMs in the given
+// resource group and assigns them the "Storage File Data SMB MI Admin" role.
+func (az *Client) EnsureNodeStorageFileDataRole(ctx context.Context, resourceGroup string) error {
+	log.Printf("Begin to assign Storage File Data SMB MI Admin role to node identities in resource group %s", resourceGroup)
+	principalIDs, err := az.GetNodeIdentityPrincipalIDs(ctx, resourceGroup)
+	if err != nil {
+		log.Printf("Failed to get node identity principal IDs: %v", err)
+		return err
+	}
+	// Storage File Data SMB MI Admin
+	const storageFileDataSMBMIAdminRoleID = "a235d3ee-5935-4cfb-8cc5-a3303ad5995e"
+	for _, principalID := range principalIDs {
+		log.Printf("Assigning Storage File Data SMB MI Admin role to principal %s ...", principalID)
+		if err := az.AssignRoleToIdentity(ctx, resourceGroup, principalID, storageFileDataSMBMIAdminRoleID); err != nil {
+			log.Printf("Failed to assign role to principal %s: %v", principalID, err)
+			return err
+		}
+		log.Printf("Successfully assigned Storage File Data SMB MI Admin role to principal %s", principalID)
+	}
+	log.Printf("Successfully assigned Storage File Data SMB MI Admin role to all %d node identities", len(principalIDs))
+	return nil
+}
+
+// NodeIdentityInfo holds identity information for a node's user-assigned identity.
+type NodeIdentityInfo struct {
+	PrincipalID string
+	ClientID    string
+	ResourceID  string
+}
+
+// GetNodeIdentityInfo returns the principalID, clientID, and resource ID of the first
+// user-assigned identity found on VMSS or VMs in the given resource group.
+// All values come from the same identity. Resource IDs are sorted for determinism.
+func (az *Client) GetNodeIdentityInfo(ctx context.Context, resourceGroup string) (*NodeIdentityInfo, error) {
+	// Check VMSS first
+	vmssPager := az.vmssClient.NewListPager(resourceGroup, nil)
+	for vmssPager.More() {
+		page, pageErr := vmssPager.NextPage(ctx)
+		if pageErr != nil {
+			return nil, fmt.Errorf("failed to list VMSS: %v", pageErr)
+		}
+		for _, vmss := range page.Value {
+			if vmss.Identity == nil {
+				continue
+			}
+			if info := pickIdentity(vmss.Identity.UserAssignedIdentities); info != nil {
+				return info, nil
+			}
+		}
+	}
+
+	// Check VMs
+	vmPager := az.vmClient.NewListPager(resourceGroup, nil)
+	for vmPager.More() {
+		page, pageErr := vmPager.NextPage(ctx)
+		if pageErr != nil {
+			return nil, fmt.Errorf("failed to list VMs: %v", pageErr)
+		}
+		for _, vm := range page.Value {
+			if vm.Identity == nil {
+				continue
+			}
+			if info := pickIdentity(vm.Identity.UserAssignedIdentities); info != nil {
+				return info, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no user-assigned identity with both principalID and clientID found in resource group %s", resourceGroup)
+}
+
+// pickIdentity selects the first valid identity from a map, sorting keys for determinism.
+func pickIdentity(identities map[string]*armcompute.UserAssignedIdentitiesValue) *NodeIdentityInfo {
+	keys := make([]string, 0, len(identities))
+	for k := range identities {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, resourceID := range keys {
+		uaIdentity := identities[resourceID]
+		if uaIdentity != nil && uaIdentity.ClientID != nil && *uaIdentity.ClientID != "" &&
+			uaIdentity.PrincipalID != nil && *uaIdentity.PrincipalID != "" {
+			return &NodeIdentityInfo{
+				PrincipalID: *uaIdentity.PrincipalID,
+				ClientID:    *uaIdentity.ClientID,
+				ResourceID:  resourceID,
 			}
 		}
 	}
 	return nil
 }
 
-func (az *Client) EnsureVirtualMachine(ctx context.Context, groupName, location, vmName string) (vm compute.VirtualMachine, err error) {
-	nic, err := az.EnsureNIC(ctx, groupName, location, vmName+"-nic", vmName+"-vnet", vmName+"-subnet")
-	if err != nil {
-		return vm, err
-	}
-
-	publicKey, err := az.EnsureSSHPublicKey(ctx, az.subscriptionID, groupName, location, "test-key")
-	if err != nil {
-		return vm, err
-	}
-
-	future, err := az.vmClient.CreateOrUpdate(
-		ctx,
-		groupName,
-		vmName,
-		compute.VirtualMachine{
-			Location: to.StringPtr(location),
-			VirtualMachineProperties: &compute.VirtualMachineProperties{
-				HardwareProfile: &compute.HardwareProfile{
-					VMSize: "Standard_DS2_v2",
-				},
-				StorageProfile: &compute.StorageProfile{
-					ImageReference: &compute.ImageReference{
-						Publisher: to.StringPtr("Canonical"),
-						Offer:     to.StringPtr("UbuntuServer"),
-						Sku:       to.StringPtr("16.04.0-LTS"),
-						Version:   to.StringPtr("latest"),
-					},
-				},
-				OsProfile: &compute.OSProfile{
-					ComputerName:  to.StringPtr(vmName),
-					AdminUsername: to.StringPtr("azureuser"),
-					AdminPassword: to.StringPtr("Azureuser1234"),
-					LinuxConfiguration: &compute.LinuxConfiguration{
-						DisablePasswordAuthentication: to.BoolPtr(true),
-						SSH: &compute.SSHConfiguration{
-							PublicKeys: &[]compute.SSHPublicKey{
-								{
-									Path:    to.StringPtr("/home/azureuser/.ssh/authorized_keys"),
-									KeyData: &publicKey,
-								},
-							},
-						},
-					},
-				},
-				NetworkProfile: &compute.NetworkProfile{
-					NetworkInterfaces: &[]compute.NetworkInterfaceReference{
-						{
-							ID: nic.ID,
-							NetworkInterfaceReferenceProperties: &compute.NetworkInterfaceReferenceProperties{
-								Primary: to.BoolPtr(true),
-							},
-						},
-					},
-				},
-			},
+// CreateFederatedIdentityCredential creates or updates a federated identity credential
+// for workload identity authentication.
+func (az *Client) CreateFederatedIdentityCredential(ctx context.Context, identityRG, identityName, ficName, issuerURL, subject string) error {
+	_, err := az.ficClient.CreateOrUpdate(ctx, identityRG, identityName, ficName, armmsi.FederatedIdentityCredential{
+		Properties: &armmsi.FederatedIdentityCredentialProperties{
+			Issuer:    to.Ptr(issuerURL),
+			Subject:   to.Ptr(subject),
+			Audiences: []*string{to.Ptr("api://AzureADTokenExchange")},
 		},
-	)
+	}, nil)
 	if err != nil {
-		return vm, fmt.Errorf("cannot create vm: %v", err)
+		return fmt.Errorf("failed to create/update federated identity credential %s: %v", ficName, err)
 	}
-
-	err = future.WaitForCompletionRef(ctx, az.vmClient.Client)
-	if err != nil {
-		return vm, fmt.Errorf("cannot get the vm create or update future response: %v", err)
-	}
-
-	return future.Result(az.vmClient)
+	return nil
 }
 
-func (az *Client) EnsureNIC(ctx context.Context, groupName, location, nicName, vnetName, subnetName string) (nic network.Interface, err error) {
-	_, err = az.EnsureVirtualNetworkAndSubnet(ctx, groupName, location, vnetName, subnetName)
+// EnsureUserAssignedIdentity creates (or updates) a user-assigned identity and
+// returns its principal ID, client ID and resource ID.
+func (az *Client) EnsureUserAssignedIdentity(ctx context.Context, resourceGroup, name, location string) (*NodeIdentityInfo, error) {
+	resp, err := az.uamiClient.CreateOrUpdate(ctx, resourceGroup, name, armmsi.Identity{Location: to.Ptr(location)}, nil)
 	if err != nil {
-		return nic, err
+		return nil, fmt.Errorf("failed to create/update user assigned identity %s: %v", name, err)
 	}
-
-	subnet, err := az.GetVirtualNetworkSubnet(ctx, groupName, vnetName, subnetName)
-	if err != nil {
-		return nic, fmt.Errorf("cannot get subnet %s of virtual network %s in %s: %v", subnetName, vnetName, groupName, err)
+	if resp.Properties == nil || resp.Properties.PrincipalID == nil || resp.Properties.ClientID == nil || resp.ID == nil {
+		return nil, fmt.Errorf("user assigned identity %s is missing principalID/clientID/id", name)
 	}
-
-	future, err := az.nicClient.CreateOrUpdate(
-		ctx,
-		groupName,
-		nicName,
-		network.Interface{
-			Name:     to.StringPtr(nicName),
-			Location: to.StringPtr(location),
-			InterfacePropertiesFormat: &network.InterfacePropertiesFormat{
-				IPConfigurations: &[]network.InterfaceIPConfiguration{
-					{
-						Name: to.StringPtr("ipConfig1"),
-						InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-							Subnet:                    &subnet,
-							PrivateIPAllocationMethod: network.Dynamic,
-						},
-					},
-				},
-			},
-		},
-	)
-	if err != nil {
-		return nic, fmt.Errorf("cannot create nic: %v", err)
-	}
-
-	err = future.WaitForCompletionRef(ctx, az.nicClient.Client)
-	if err != nil {
-		return nic, fmt.Errorf("cannot get nic create or update future response: %v", err)
-	}
-
-	return future.Result(az.nicClient)
-}
-
-func (az *Client) EnsureVirtualNetworkAndSubnet(ctx context.Context, groupName, location, vnetName, subnetName string) (vnet network.VirtualNetwork, err error) {
-	future, err := az.vnetClient.CreateOrUpdate(
-		ctx,
-		groupName,
-		vnetName,
-		network.VirtualNetwork{
-			Location: to.StringPtr(location),
-			VirtualNetworkPropertiesFormat: &network.VirtualNetworkPropertiesFormat{
-				AddressSpace: &network.AddressSpace{
-					AddressPrefixes: &[]string{"10.0.0.0/8"},
-				},
-				Subnets: &[]network.Subnet{
-					{
-						Name: to.StringPtr(subnetName),
-						SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
-							AddressPrefix: to.StringPtr("10.0.0.0/16"),
-						},
-					},
-				},
-			},
-		})
-
-	if err != nil {
-		return vnet, fmt.Errorf("cannot create virtual network: %v", err)
-	}
-
-	err = future.WaitForCompletionRef(ctx, az.vnetClient.Client)
-	if err != nil {
-		return vnet, fmt.Errorf("cannot get the vnet create or update future response: %v", err)
-	}
-
-	return future.Result(az.vnetClient)
-}
-
-func (az *Client) GetVirtualNetworkSubnet(ctx context.Context, groupName, vnetName, subnetName string) (network.Subnet, error) {
-	return az.subnetsClient.Get(ctx, groupName, vnetName, subnetName, "")
-}
-
-func (az *Client) GetStorageAccount(ctx context.Context, groupName, accountName string) (storage.Account, error) {
-	return az.accountsClient.GetProperties(ctx, groupName, accountName, "")
-}
-
-func getOAuthConfig(env azure.Environment, subscriptionID, tenantID string) (*adal.OAuthConfig, error) {
-	oauthConfig, err := adal.NewOAuthConfig(env.ActiveDirectoryEndpoint, tenantID)
-	if err != nil {
-		return nil, err
-	}
-
-	return oauthConfig, nil
-}
-
-func getClient(env azure.Environment, subscriptionID, tenantID string, armSpt *adal.ServicePrincipalToken) *Client {
-	c := &Client{
-		environment:         env,
-		subscriptionID:      subscriptionID,
-		groupsClient:        resources.NewGroupsClientWithBaseURI(env.ResourceManagerEndpoint, subscriptionID),
-		vmClient:            compute.NewVirtualMachinesClient(subscriptionID),
-		nicClient:           network.NewInterfacesClient(subscriptionID),
-		subnetsClient:       network.NewSubnetsClient(subscriptionID),
-		vnetClient:          network.NewVirtualNetworksClient(subscriptionID),
-		accountsClient:      storage.NewAccountsClient(subscriptionID),
-		filesharesClient:    storage.NewFileSharesClient(subscriptionID),
-		sshPublicKeysClient: compute.NewSSHPublicKeysClientWithBaseURI(env.ResourceManagerEndpoint, subscriptionID),
-	}
-
-	authorizer := autorest.NewBearerAuthorizer(armSpt)
-	c.groupsClient.Authorizer = authorizer
-	c.vmClient.Authorizer = authorizer
-	c.nicClient.Authorizer = authorizer
-	c.subnetsClient.Authorizer = authorizer
-	c.vnetClient.Authorizer = authorizer
-	c.accountsClient.Authorizer = authorizer
-	c.filesharesClient.Authorizer = authorizer
-	c.sshPublicKeysClient.Authorizer = authorizer
-
-	return c
-}
-
-func stringPointer(s string) *string {
-	return &s
+	return &NodeIdentityInfo{
+		PrincipalID: *resp.Properties.PrincipalID,
+		ClientID:    *resp.Properties.ClientID,
+		ResourceID:  *resp.ID,
+	}, nil
 }

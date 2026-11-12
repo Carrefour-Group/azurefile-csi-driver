@@ -42,7 +42,6 @@ type CSIProxyMounter interface {
 	mount.Interface
 
 	SMBMount(source, target, fsType string, mountOptions, sensitiveMountOptions []string) error
-	SMBUnmount(target string) error
 	MakeDir(path string) error
 	Rmdir(path string) error
 	IsMountPointMatch(mp mount.MountPoint, dir string) bool
@@ -67,7 +66,7 @@ func normalizeWindowsPath(path string) string {
 }
 
 func (mounter *csiProxyMounter) SMBMount(source, target, fsType string, mountOptions, sensitiveMountOptions []string) error {
-	klog.V(4).Infof("SMBMount: remote path: %s. local path: %s", source, target)
+	klog.V(2).Infof("SMBMount: remote path: %s local path: %s", source, target)
 
 	if len(mountOptions) == 0 || len(sensitiveMountOptions) == 0 {
 		return fmt.Errorf("empty mountOptions(len: %d) or sensitiveMountOptions(len: %d) is not allowed", len(mountOptions), len(sensitiveMountOptions))
@@ -80,30 +79,26 @@ func (mounter *csiProxyMounter) SMBMount(source, target, fsType string, mountOpt
 	}
 
 	if !parentExists {
-		klog.Infof("Parent directory %s does not exists. Creating the directory", parentDir)
+		klog.V(2).Infof("Parent directory %s does not exists. Creating the directory", parentDir)
 		if err := mounter.MakeDir(parentDir); err != nil {
 			return fmt.Errorf("create of parent dir: %s dailed with error: %v", parentDir, err)
 		}
 	}
 
 	source = strings.Replace(source, "/", "\\", -1)
+	normalizedTarget := normalizeWindowsPath(target)
 	smbMountRequest := &smb.NewSmbGlobalMappingRequest{
-		LocalPath:  normalizeWindowsPath(target),
+		LocalPath:  normalizedTarget,
 		RemotePath: source,
 		Username:   mountOptions[0],
 		Password:   sensitiveMountOptions[0],
 	}
+	klog.V(2).Infof("begin to mount %s on %s", source, normalizedTarget)
 	if _, err := mounter.SMBClient.NewSmbGlobalMapping(context.Background(), smbMountRequest); err != nil {
 		return fmt.Errorf("smb mapping failed with error: %v", err)
 	}
+	klog.V(2).Infof("mount %s on %s successfully", source, normalizedTarget)
 	return nil
-}
-
-func (mounter *csiProxyMounter) SMBUnmount(target string) error {
-	klog.V(4).Infof("SMBUnmount: local path: %s", target)
-	// TODO: We need to remove the SMB mapping. The change to remove the
-	// directory brings the CSI code in parity with the in-tree.
-	return mounter.Rmdir(target)
 }
 
 // Mount just creates a soft link at target pointing to source.
@@ -124,8 +119,8 @@ func (mounter *csiProxyMounter) Mount(source string, target string, fstype strin
 
 // Rmdir - delete the given directory
 // TODO: Call separate rmdir for pod context and plugin context. v1alpha1 for CSI
-//       proxy does a relaxed check for prefix as c:\var\lib\kubelet, so we can do
-//       rmdir with either pod or plugin context.
+// proxy does a relaxed check for prefix as c:\var\lib\kubelet, so we can do
+// rmdir with either pod or plugin context.
 func (mounter *csiProxyMounter) Rmdir(path string) error {
 	klog.V(4).Infof("Remove directory: %s", path)
 	rmdirRequest := &fs.RmdirRequest{
@@ -154,8 +149,8 @@ func (mounter *csiProxyMounter) IsMountPointMatch(mp mount.MountPoint, dir strin
 }
 
 // IsLikelyMountPoint - If the directory does not exists, the function will return os.ErrNotExist error.
-//   If the path exists, call to CSI proxy will check if its a link, if its a link then existence of target
-//   path is checked.
+// If the path exists, call to CSI proxy will check if its a link, if its a link then existence of target
+// path is checked.
 func (mounter *csiProxyMounter) IsLikelyNotMountPoint(path string) (bool, error) {
 	klog.V(4).Infof("IsLikelyNotMountPoint: %s", path)
 	isExists, err := mounter.ExistsPath(path)
@@ -238,6 +233,18 @@ func (mounter *csiProxyMounter) EvalHostSymlinks(pathname string) (string, error
 	return "", fmt.Errorf("EvalHostSymlinks not implemented for CSIProxyMounter")
 }
 
+func (mounter *csiProxyMounter) IsMountPoint(file string) (bool, error) {
+	isNotMnt, err := mounter.IsLikelyNotMountPoint(file)
+	if err != nil {
+		return false, err
+	}
+	return !isNotMnt, nil
+}
+
+func (mounter *csiProxyMounter) CanSafelySkipMountPointCheck() bool {
+	return false
+}
+
 func (mounter *csiProxyMounter) GetMountRefs(pathname string) ([]string, error) {
 	return []string{}, fmt.Errorf("GetMountRefs not implemented for CSIProxyMounter")
 }
@@ -262,6 +269,10 @@ func (mounter *csiProxyMounter) MountSensitiveWithoutSystemd(source string, targ
 	return fmt.Errorf("MountSensitiveWithoutSystemd not implemented for CSIProxyMounter")
 }
 
+func (mounter *csiProxyMounter) MountSensitiveWithoutSystemdWithMountFlags(source string, target string, fstype string, options []string, sensitiveOptions []string, mountFlags []string) error {
+	return mounter.MountSensitive(source, target, fstype, options, sensitiveOptions /* sensitiveOptions */)
+}
+
 // NewCSIProxyMounter - creates a new CSI Proxy mounter struct which encompassed all the
 // clients to the CSI proxy - filesystem, disk and volume clients.
 func NewCSIProxyMounter() (*csiProxyMounter, error) {
@@ -280,7 +291,14 @@ func NewCSIProxyMounter() (*csiProxyMounter, error) {
 	}, nil
 }
 
-func NewSafeMounter() (*mount.SafeFormatAndMount, error) {
+func NewSafeMounter(enableWindowsHostProcess, useWinCIMAPI bool) (*mount.SafeFormatAndMount, error) {
+	if enableWindowsHostProcess {
+		klog.V(2).Infof("using windows host process mounter")
+		return &mount.SafeFormatAndMount{
+			Interface: NewWinMounter(useWinCIMAPI),
+			Exec:      utilexec.New(),
+		}, nil
+	}
 	csiProxyMounter, err := NewCSIProxyMounter()
 	if err == nil {
 		klog.V(2).Infof("using CSIProxyMounterV1, %s", csiProxyMounter.GetAPIVersions())

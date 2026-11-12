@@ -5,10 +5,19 @@ metadata:
   name: csi-snapshot-controller
   namespace: kube-system
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: csi-snapshot-controller
+  # the snapshot controller won't be marked as ready if the v1 CRDs are unavailable
+  # in #504 the snapshot-controller will exit after around 7.5 seconds if it
+  # can't find the v1 CRDs so this value should be greater than that
+  minReadySeconds: 15
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
   template:
     metadata:
       labels:
@@ -18,6 +27,9 @@ spec:
       nodeSelector:
         kubernetes.io/os: linux
       priorityClassName: system-cluster-critical
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       tolerations:
         - key: "node-role.kubernetes.io/master"
           operator: "Equal"
@@ -27,16 +39,27 @@ spec:
           operator: "Equal"
           value: "true"
           effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
       containers:
         - name: csi-snapshot-controller
-          image: mcr.microsoft.com/oss/kubernetes-csi/snapshot-controller:v3.0.3
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/snapshot-controller:v8.7.0
           args:
             - "--v=2"
-            - "--leader-election=false"
+            - "--leader-election=true"
+            - "--leader-election-namespace=kube-system"
+            - "--kube-api-qps=100"
+            - "--kube-api-burst=200"
+            - "--retry-interval-max=30m"
           resources:
             limits:
-              cpu: 100m
-              memory: 100Mi
+              memory: 500Mi
             requests:
               cpu: 10m
               memory: 20Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL

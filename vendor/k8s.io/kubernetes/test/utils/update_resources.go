@@ -17,6 +17,7 @@ limitations under the License.
 package utils
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -35,9 +36,9 @@ const (
 	waitRetryTimeout    = 5 * time.Minute
 )
 
-func RetryErrorCondition(condition wait.ConditionFunc) wait.ConditionFunc {
-	return func() (bool, error) {
-		done, err := condition()
+func RetryErrorCondition(condition wait.ConditionWithContextFunc) wait.ConditionWithContextFunc {
+	return func(ctx context.Context) (bool, error) {
+		done, err := condition(ctx)
 		return done, err
 	}
 }
@@ -50,12 +51,12 @@ func ScaleResourceWithRetries(scalesGetter scaleclient.ScalesGetter, namespace, 
 	}
 	waitForReplicas := scale.NewRetryParams(waitRetryInterval, waitRetryTimeout)
 	cond := RetryErrorCondition(scale.ScaleCondition(scaler, preconditions, namespace, name, size, nil, gvr, false))
-	err := wait.PollImmediate(updateRetryInterval, updateRetryTimeout, cond)
+	err := wait.PollUntilContextTimeout(context.Background(), updateRetryInterval, updateRetryTimeout, true, cond)
 	if err == nil {
 		err = scale.WaitForScaleHasDesiredReplicas(scalesGetter, gvr.GroupResource(), name, namespace, size, waitForReplicas)
 	}
 	if err != nil {
-		return fmt.Errorf("Error while scaling %s to %d replicas: %v", name, size, err)
+		return fmt.Errorf("error while scaling %s to %d replicas: %v", name, size, err)
 	}
 	return nil
 }

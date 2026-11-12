@@ -24,7 +24,7 @@ import (
 	"k8s.io/klog/v2"
 	azurefile "sigs.k8s.io/azurefile-csi-driver/pkg/azurefile"
 
-	"github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -39,7 +39,7 @@ type AzureFileDriver struct {
 	driverName string
 }
 
-// InitAzureFileDriver returns AzureFileDriver that implemnts DynamicPVTestDriver interface
+// InitAzureFileDriver returns AzureFileDriver that implements DynamicPVTestDriver interface
 func InitAzureFileDriver() PVTestDriver {
 	driverName := os.Getenv(AzureDriverNameVar)
 	if driverName == "" {
@@ -58,22 +58,35 @@ func normalizeProvisioner(provisioner string) string {
 	return strings.ToLower(strings.ReplaceAll(provisioner, "/", "-"))
 }
 
-func (d *AzureFileDriver) GetDynamicProvisionStorageClass(parameters map[string]string, mountOptions []string, reclaimPolicy *v1.PersistentVolumeReclaimPolicy, bindingMode *storagev1.VolumeBindingMode, allowedTopologyValues []string, namespace string) *storagev1.StorageClass {
+func (d *AzureFileDriver) GetDynamicProvisionStorageClass(parameters map[string]string, mountOptions []string, reclaimPolicy *v1.PersistentVolumeReclaimPolicy, bindingMode *storagev1.VolumeBindingMode, _ []string, namespace string) *storagev1.StorageClass {
 	provisioner := d.driverName
 	generateName := fmt.Sprintf("%s-%s-dynamic-sc-", namespace, normalizeProvisioner(provisioner))
 	return getStorageClass(generateName, provisioner, parameters, mountOptions, reclaimPolicy, bindingMode, nil)
 }
 
-func (d *AzureFileDriver) GetPreProvisionStorageClass(parameters map[string]string, mountOptions []string, reclaimPolicy *v1.PersistentVolumeReclaimPolicy, bindingMode *storagev1.VolumeBindingMode, allowedTopologyValues []string, namespace string) *storagev1.StorageClass {
+func (d *AzureFileDriver) GetPreProvisionStorageClass(parameters map[string]string, mountOptions []string, reclaimPolicy *v1.PersistentVolumeReclaimPolicy, bindingMode *storagev1.VolumeBindingMode, _ []string, namespace string) *storagev1.StorageClass {
 	provisioner := d.driverName
 	generateName := fmt.Sprintf("%s-%s-pre-provisioned-sc-", namespace, provisioner)
 	return getStorageClass(generateName, provisioner, parameters, mountOptions, reclaimPolicy, bindingMode, nil)
 }
 
-func (d *AzureFileDriver) GetVolumeSnapshotClass(namespace string) *v1beta1.VolumeSnapshotClass {
+func (d *AzureFileDriver) GetVolumeSnapshotClass(namespace string) *snapshotv1.VolumeSnapshotClass {
 	provisioner := d.driverName
 	generateName := fmt.Sprintf("%s-%s-dynamic-sc-", namespace, normalizeProvisioner(provisioner))
 	return getVolumeSnapshotClass(generateName, provisioner)
+}
+
+func (d *AzureFileDriver) GetVolumeAttributesClass(namespace string) *storagev1.VolumeAttributesClass {
+	return &storagev1.VolumeAttributesClass{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-%s-vac-", namespace, normalizeProvisioner(d.driverName)),
+		},
+		DriverName: d.driverName,
+		Parameters: map[string]string{
+			"provisionedIOPS":      "5000",
+			"provisionedBandwidth": "200",
+		},
+	}
 }
 
 func (d *AzureFileDriver) GetPersistentVolume(volumeID string, fsType string, size string, reclaimPolicy *v1.PersistentVolumeReclaimPolicy, namespace string, attrib map[string]string, nodeStageSecretRef string) *v1.PersistentVolume {

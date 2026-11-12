@@ -17,9 +17,9 @@ limitations under the License.
 package testsuites
 
 import (
-	"time"
+	"context"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/azurefile-csi-driver/test/e2e/driver"
@@ -34,35 +34,33 @@ type DynamicallyProvisionedStatefulSetTest struct {
 	PodCheck  *PodExecCheck
 }
 
-func (t *DynamicallyProvisionedStatefulSetTest) Run(client clientset.Interface, namespace *v1.Namespace) {
-	tStatefulSet, cleanup := t.Pod.SetupStatefulset(client, namespace, t.CSIDriver)
+func (t *DynamicallyProvisionedStatefulSetTest) Run(ctx context.Context, client clientset.Interface, namespace *v1.Namespace) {
+	tStatefulSet, cleanup := t.Pod.SetupStatefulset(ctx, client, namespace, t.CSIDriver)
 	// defer must be called here for resources not get removed before using them
 	for i := range cleanup {
-		defer cleanup[i]()
+		defer cleanup[i](ctx)
 	}
 
 	ginkgo.By("deploying the statefulset")
-	tStatefulSet.Create()
+	tStatefulSet.Create(ctx)
 
 	ginkgo.By("checking that the pod is running")
-	tStatefulSet.WaitForPodReady()
+	tStatefulSet.WaitForPodReady(ctx)
 
 	if t.PodCheck != nil {
-		ginkgo.By("sleep 3s and then check pod exec")
-		time.Sleep(3 * time.Second)
-		tStatefulSet.Exec(t.PodCheck.Cmd, t.PodCheck.ExpectedString)
+		ginkgo.By("check pod exec")
+		tStatefulSet.PollForStringInPodsExec(t.PodCheck.Cmd, t.PodCheck.ExpectedString)
 	}
 
 	ginkgo.By("deleting the pod for statefulset")
-	tStatefulSet.DeletePodAndWait()
+	tStatefulSet.DeletePodAndWait(ctx)
 
 	ginkgo.By("checking again that the pod is running")
-	tStatefulSet.WaitForPodReady()
+	tStatefulSet.WaitForPodReady(ctx)
 
 	if t.PodCheck != nil {
-		ginkgo.By("sleep 3s and then check pod exec after pod restart again")
-		time.Sleep(3 * time.Second)
+		ginkgo.By("check pod exec")
 		// pod will be restarted so expect to see 2 instances of string
-		tStatefulSet.Exec(t.PodCheck.Cmd, t.PodCheck.ExpectedString+t.PodCheck.ExpectedString)
+		tStatefulSet.PollForStringInPodsExec(t.PodCheck.Cmd, t.PodCheck.ExpectedString+t.PodCheck.ExpectedString)
 	}
 }

@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 
 	v1 "k8s.io/api/core/v1"
@@ -43,40 +43,39 @@ type DynamicallyProvisionedAccountWithTags struct {
 	Tags                   string
 }
 
-func (t *DynamicallyProvisionedAccountWithTags) Run(client clientset.Interface, namespace *v1.Namespace) {
+func (t *DynamicallyProvisionedAccountWithTags) Run(ctx context.Context, client clientset.Interface, namespace *v1.Namespace) {
 	for _, volume := range t.Volumes {
-		tpvc, _ := volume.SetupDynamicPersistentVolumeClaim(client, namespace, t.CSIDriver, t.StorageClassParameters)
-		defer tpvc.Cleanup()
+		tpvc, _ := volume.SetupDynamicPersistentVolumeClaim(ctx, client, namespace, t.CSIDriver, t.StorageClassParameters)
+		defer tpvc.Cleanup(ctx)
 
 		ginkgo.By("checking whether the storage account contains tags")
 
 		pvName := tpvc.persistentVolume.ObjectMeta.Name
-		pv, err := client.CoreV1().PersistentVolumes().Get(context.TODO(), pvName, metav1.GetOptions{})
+		pv, err := client.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
 		framework.ExpectNoError(err, fmt.Sprintf("failed to get pv(%s): %v", pvName, err))
 
 		volumeID := pv.Spec.PersistentVolumeSource.CSI.VolumeHandle
-		resourceGroupName, accountName, _, _, err := azurefile.GetFileShareInfo(volumeID)
+		resourceGroupName, accountName, _, _, _, _, err := azurefile.GetFileShareInfo(volumeID)
 		framework.ExpectNoError(err, fmt.Sprintf("failed to get fileShare(%s) info: %v", volumeID, err))
 
 		creds, err := credentials.CreateAzureCredentialFile(false)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		azureClient, err := azureUtils.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret)
+		azureClient, err := azureUtils.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret, creds.AADFederatedTokenFile)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-		//get disk information
-		account, err := azureClient.GetStorageAccount(context.TODO(), resourceGroupName, accountName)
+		account, err := azureClient.GetStorageAccount(ctx, resourceGroupName, accountName)
 		framework.ExpectNoError(err, fmt.Sprintf("failed to get storage account(%s): %v", accountName, err))
 
 		resultTags := account.Tags
 
-		specifiedTags, err := azurefile.ConvertTagsToMap(t.Tags)
+		specifiedTags, err := azurefile.ConvertTagsToMap(t.Tags, "")
 		framework.ExpectNoError(err, fmt.Sprintf("failed to convert tags(%s) %v", t.Tags, err))
 		specifiedTags["k8s-azure-created-by"] = "azure"
 
 		for k, v := range specifiedTags {
 			_, ok := resultTags[k]
 			if ok {
-				framework.ExpectEqual(*resultTags[k], v)
+				gomega.Expect(*resultTags[k]).To(gomega.Equal(v))
 			} else {
 				framework.Failf("the specified key(%s) does exist in result tags", k)
 			}

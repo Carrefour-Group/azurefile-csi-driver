@@ -13,8 +13,7 @@ kubectl create -f https://raw.githubusercontent.com/kubernetes-sigs/azurefile-cs
 ```
  > set `useDataPlaneAPI: "true"` in storage class `parameters` when creating > 100 file shares in parallel to prevent [storage resource provider throttling](https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/azure-subscription-service-limits#storage-resource-provider-limits)
  >
-#### Option#2: bring your own storage account
- > only available from `v0.9.0`
+#### Option#2: bring your own storage account (only for SMB protocol)
  - Use `kubectl create secret` to create `azure-secret` with existing storage account name and key
 ```console
 kubectl create secret generic azure-secret --from-literal azurestorageaccountname=NAME --from-literal azurestorageaccountkey="KEY" --type=Opaque
@@ -58,6 +57,14 @@ parameters:
   shareName: SHARE_NAME
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
+mountOptions:
+  - dir_mode=0777
+  - file_mode=0777
+  - mfsymlinks
+  - cache=strict  # https://linux.die.net/man/8/mount.cifs
+  - nosharesock  # reduce probability of reconnect race
+  - actimeo=30  # reduce latency for metadata-heavy workload
+  - nobrl  # disable sending byte range lock requests to the server and for applications which have challenges with posix locks
 ```
 
  - Create storage class and PVC
@@ -102,10 +109,10 @@ Filesystem                                                                Size  
 In the above example, there is a `/mnt/azurefile` directory mounted as cifs filesystem.
 
 #### Option#3: Inline volume
- > only available from `v1.3.0` for SMB protocol (NFS protocol is not supported) <br>
- > inline volume feature can only read storage account name and key in the same namespace, cannot use cluster identity to read storage account name and key <br>
- - Create `azure-secret` with existing storage account name and key in the same namespace as pod
- > in below example, both secret and pod are in `default` namespace
+ >  - inline volume does not support nfs protocol
+ >  - to avoid performance issue, use persistent volume instead of inline volume when numerous pods are accessing the same volume
+ >  - `secretNamespace` parameter is not required since the secret must be in the same namespace as pod
+ - in below SMB protocol example, create `azure-secret` with existing storage account name and key in the same namespace as pod, both secret and pod are in `default` namespace
 ```console
 kubectl create secret generic azure-secret --from-literal azurestorageaccountname=NAME --from-literal azurestorageaccountkey="KEY" --type=Opaque
 ```

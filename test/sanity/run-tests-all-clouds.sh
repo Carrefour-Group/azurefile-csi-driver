@@ -21,7 +21,7 @@ function install_csi_sanity_bin {
   mkdir -p $GOPATH/src/github.com/kubernetes-csi
   pushd $GOPATH/src/github.com/kubernetes-csi
   export GO111MODULE=off
-  git clone https://github.com/kubernetes-csi/csi-test.git -b v4.2.0
+  git clone https://github.com/kubernetes-csi/csi-test.git -b v5.4.0
   pushd csi-test/cmd/csi-sanity
   make install
   popd
@@ -32,4 +32,6 @@ apt update && apt install cifs-utils procps -y
 if [[ -z "$(command -v csi-sanity)" ]]; then
 	install_csi_sanity_bin
 fi
+
+declare nodeid
 test/sanity/run-test.sh "$nodeid"

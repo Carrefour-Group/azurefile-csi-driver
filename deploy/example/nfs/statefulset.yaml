@@ -17,7 +17,7 @@ spec:
         "kubernetes.io/os": linux
       containers:
         - name: statefulset-azurefile
-          image: mcr.microsoft.com/oss/nginx/nginx:1.19.5
+          image: mcr.microsoft.com/mirror/docker/library/nginx:1.23
           command:
             - "/bin/bash"
             - "-c"
@@ -25,6 +25,7 @@ spec:
           volumeMounts:
             - name: persistent-storage
               mountPath: /mnt/azurefile
+              readOnly: false
   updateStrategy:
     type: RollingUpdate
   selector:
@@ -33,9 +34,8 @@ spec:
   volumeClaimTemplates:
     - metadata:
         name: persistent-storage
-        annotations:
-          volume.beta.kubernetes.io/storage-class: azurefile-csi-nfs
       spec:
+        storageClassName: azurefile-csi-nfs
         accessModes: ["ReadWriteMany"]
         resources:
           requests:

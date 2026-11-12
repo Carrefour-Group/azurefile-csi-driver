@@ -10,6 +10,9 @@
             "kubernetesConfig": {
                 "useManagedIdentity": false,
                 "containerRuntime": "containerd",
+                "apiServerConfig": {
+                    "--disable-admission-plugins": "PodSecurity"
+                },
                 "windowsContainerdURL": "https://acs-mirror.azureedge.net/containerd/windows/v0.0.41/binaries/containerd-v0.0.41-windows-amd64.tar.gz"
             }
         },
@@ -31,7 +34,7 @@
         "windowsProfile": {
             "adminUsername": "azureuser",
             "adminPassword": "replacepassword1234$",
-            "csiProxyURL": "https://acs-mirror.azureedge.net/csi-proxy/v0.2.2/binaries/csi-proxy-v0.2.2.tar.gz",
+            "csiProxyURL": "https://acs-mirror.azureedge.net/csi-proxy/v1.1.1/binaries/csi-proxy-v1.1.1.tar.gz",
             "enableCSIProxy": true,
             "sshEnabled": true,
             "windowsPublisher": "microsoft-aks",

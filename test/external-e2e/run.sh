@@ -20,24 +20,20 @@ PROJECT_ROOT=$(git rev-parse --show-toplevel)
 DRIVER="test"
 
 install_ginkgo () {
-    apt update -y
-    apt install -y golang-ginkgo-dev
+    go install github.com/onsi/ginkgo/v2/ginkgo@v2.13.2
 }
 
 setup_e2e_binaries() {
     # download k8s external e2e binary for kubernetes
-    curl -sL https://storage.googleapis.com/kubernetes-release/release/v1.22.0/kubernetes-test-linux-amd64.tar.gz --output e2e-tests.tar.gz
+    curl -sL https://dl.k8s.io/release/v1.26.0/kubernetes-test-linux-amd64.tar.gz --output e2e-tests.tar.gz
     tar -xvf e2e-tests.tar.gz && rm e2e-tests.tar.gz
 
-    if [ ! -z ${EXTERNAL_E2E_TEST_NFS} ]; then
-        # enable fsGroupPolicy (only available from k8s 1.20)
-        export EXTRA_HELM_OPTIONS="--set feature.enableFSGroupPolicy=true"
-    fi
-    export EXTRA_HELM_OPTIONS="${EXTRA_HELM_OPTIONS} --set image.csiProvisioner.tag=v3.0.0 --set snapshot.apiVersion=ga"
     # test on alternative driver name
-    EXTRA_HELM_OPTIONS=$EXTRA_HELM_OPTIONS" --set driver.name=$DRIVER.csi.azure.com --set controller.name=csi-$DRIVER-controller --set linux.dsName=csi-$DRIVER-node --set windows.dsName=csi-$DRIVER-node-win"
+    export EXTRA_HELM_OPTIONS=" --set driver.name=$DRIVER.csi.azure.com --set controller.name=csi-$DRIVER-controller --set linux.dsName=csi-$DRIVER-node --set windows.dsName=csi-$DRIVER-node-win"
     sed -i "s/file.csi.azure.com/$DRIVER.csi.azure.com/g" deploy/example/storageclass-azurefile-csi.yaml
     sed -i "s/file.csi.azure.com/$DRIVER.csi.azure.com/g" deploy/example/storageclass-azurefile-nfs.yaml
+    # run e2e test on standard storage class since premium file share only supports volume size >= 100GiB
+    sed -i "s/Premium/Standard/g" deploy/example/storageclass-azurefile-csi.yaml
     make e2e-bootstrap
     sed -i "s/csi-azurefile-controller/csi-$DRIVER-controller/g" deploy/example/metrics/csi-azurefile-controller-svc.yaml
     make create-metrics-svc
@@ -59,7 +55,7 @@ if [ ! -z ${EXTERNAL_E2E_TEST_SMB} ]; then
 	echo "begin to run SMB protocol tests ...."
 	cp deploy/example/storageclass-azurefile-csi.yaml /tmp/csi/storageclass.yaml
 	ginkgo -p --progress --v -focus="External.Storage.*$DRIVER.csi.azure.com" \
-		-skip='\[Disruptive\]|\[Slow\]|should be able to unmount after the subpath directory is deleted|volume contents ownership changed' kubernetes/test/bin/e2e.test  -- \
+		-skip='\[Disruptive\]|volume contents ownership changed|should provision storage with any volume data source|should mount multiple PV pointing to the same storage on the same node' kubernetes/test/bin/e2e.test  -- \
 		-storage.testdriver=$PROJECT_ROOT/test/external-e2e/testdriver-smb.yaml \
 		--kubeconfig=$KUBECONFIG
 fi
@@ -68,7 +64,7 @@ if [ ! -z ${EXTERNAL_E2E_TEST_NFS} ]; then
 	echo "begin to run NFS protocol tests ...."
 	cp deploy/example/storageclass-azurefile-nfs.yaml /tmp/csi/storageclass.yaml
 	ginkgo -p --progress --v -focus="External.Storage.*$DRIVER.csi.azure.com" \
-		-skip='\[Disruptive\]|\[Slow\]' kubernetes/test/bin/e2e.test  -- \
+		-skip='\[Disruptive\]|should provision storage with any volume data source|should mount multiple PV pointing to the same storage on the same node|pod created with an initial fsgroup, volume contents ownership changed via chgrp in first pod, new pod with same fsgroup applied to the volume contents' kubernetes/test/bin/e2e.test  -- \
 		-storage.testdriver=$PROJECT_ROOT/test/external-e2e/testdriver-nfs.yaml \
 		--kubeconfig=$KUBECONFIG
 fi

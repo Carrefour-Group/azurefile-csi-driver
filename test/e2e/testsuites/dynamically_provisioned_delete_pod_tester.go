@@ -17,11 +17,13 @@ limitations under the License.
 package testsuites
 
 import (
+	"context"
+	"fmt"
 	"time"
 
 	"sigs.k8s.io/azurefile-csi-driver/test/e2e/driver"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 )
@@ -41,35 +43,38 @@ type PodExecCheck struct {
 	ExpectedString string
 }
 
-func (t *DynamicallyProvisionedDeletePodTest) Run(client clientset.Interface, namespace *v1.Namespace) {
-	tDeployment, cleanup := t.Pod.SetupDeployment(client, namespace, t.CSIDriver, t.StorageClassParameters)
+func (t *DynamicallyProvisionedDeletePodTest) Run(ctx context.Context, client clientset.Interface, namespace *v1.Namespace) {
+	tDeployment, cleanup, _ := t.Pod.SetupDeployment(ctx, client, namespace, 1 /*replicas*/, t.CSIDriver, t.StorageClassParameters)
 	// defer must be called here for resources not get removed before using them
 	for i := range cleanup {
-		defer cleanup[i]()
+		defer cleanup[i](ctx)
 	}
 
 	ginkgo.By("deploying the deployment")
-	tDeployment.Create()
+	tDeployment.Create(ctx)
 
 	ginkgo.By("checking that the pod is running")
-	tDeployment.WaitForPodReady()
+	tDeployment.WaitForPodReady(ctx)
 
 	if t.PodCheck != nil {
 		time.Sleep(time.Second)
-		ginkgo.By("sleep 1s and then check pod exec")
-		tDeployment.Exec(t.PodCheck.Cmd, t.PodCheck.ExpectedString)
+		ginkgo.By("check pod exec")
+		tDeployment.PollForStringInPodsExec(t.PodCheck.Cmd, t.PodCheck.ExpectedString)
 	}
 
-	ginkgo.By("deleting the pod for deployment")
-	tDeployment.DeletePodAndWait()
+	// repeat to make sure mount/unmount is stable
+	for i := 0; i < 10; i++ {
+		ginkgo.By(fmt.Sprintf("deleting the pod for deployment, %d times", i))
+		tDeployment.DeletePodAndWait(ctx)
 
-	ginkgo.By("checking again that the pod is running")
-	tDeployment.WaitForPodReady()
+		ginkgo.By(fmt.Sprintf("checking again that the pod is running, %d times", i))
+		tDeployment.WaitForPodReady(ctx)
+	}
 
 	if t.PodCheck != nil {
 		time.Sleep(time.Second)
 		ginkgo.By("sleep 1s and then check pod exec")
 		// pod will be restarted so expect to see 2 instances of string
-		tDeployment.Exec(t.PodCheck.Cmd, t.PodCheck.ExpectedString+t.PodCheck.ExpectedString)
+		tDeployment.PollForStringInPodsExec(t.PodCheck.Cmd, t.PodCheck.ExpectedString)
 	}
 }

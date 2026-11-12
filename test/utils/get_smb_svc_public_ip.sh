@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Copyright 2020 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +14,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/bin/bash
-
 set -e
-kubectl get svc smb-server | grep smb | awk '{print $4}'
+kubectl get svc smb-server -n default | grep smb | awk '{print $4}'

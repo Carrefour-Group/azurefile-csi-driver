@@ -17,20 +17,26 @@ GIT_COMMIT ?= $(shell git rev-parse HEAD)
 REGISTRY ?= andyzhangx
 REGISTRY_NAME ?= $(shell echo $(REGISTRY) | sed "s/.azurecr.io//g")
 IMAGE_NAME ?= azurefile-csi
-IMAGE_VERSION ?= v1.7.0
+IMAGE_VERSION ?= v1.36.0
 # Use a custom version for E2E tests if we are testing in CI
 ifdef CI
 ifndef PUBLISH
 override IMAGE_VERSION := e2e-$(GIT_COMMIT)
 endif
 endif
-IMAGE_TAG ?= $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_VERSION)
-IMAGE_TAG_LATEST = $(REGISTRY)/$(IMAGE_NAME):latest
+CSI_IMAGE_TAG ?= $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_VERSION)
+CSI_IMAGE_TAG_LATEST = $(REGISTRY)/$(IMAGE_NAME):latest
 BUILD_DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS ?= "-X ${PKG}/pkg/azurefile.driverVersion=${IMAGE_VERSION} -X ${PKG}/pkg/azurefile.gitCommit=${GIT_COMMIT} -X ${PKG}/pkg/azurefile.buildDate=${BUILD_DATE} -s -w -extldflags '-static'"
-E2E_HELM_OPTIONS ?= --set image.azurefile.repository=$(REGISTRY)/$(IMAGE_NAME) --set image.azurefile.tag=$(IMAGE_VERSION) --set linux.dnsPolicy=ClusterFirstWithHostNet --set driver.userAgentSuffix="e2e-test"
+E2E_HELM_OPTIONS ?= --set image.azurefile.repository=$(REGISTRY)/$(IMAGE_NAME) --set image.azurefile.tag=$(IMAGE_VERSION) --set node.enableKataCCMount=true --set linux.dnsPolicy=ClusterFirstWithHostNet --set driver.userAgentSuffix="e2e-test" --set controller.runOnControlPlane=true --set controller.replicas=1 --set snapshot.snapshotController.replicas=1 --set node.azurefileProxy.migrateK8sRepo=true --set node.azurefileProxy.enabled=true --set node.azurefileProxy.installAznfsMount=true --set node.useAZNFSForNFSMounts=true --set feature.serviceAccountTokenInSecrets=true
 E2E_HELM_OPTIONS += ${EXTRA_HELM_OPTIONS}
-GINKGO_FLAGS = -ginkgo.v
+ifdef KUBERNETES_VERSION # disable kubelet-registration-probe on capz cluster testing
+E2E_HELM_OPTIONS += --set linux.enableRegistrationProbe=false --set windows.enableRegistrationProbe=false
+endif
+ifdef EXTERNAL_E2E_TEST_NFS
+E2E_HELM_OPTIONS += --set feature.enableVolumeMountGroup=false --set feature.fsGroupPolicy=File
+endif
+GINKGO_FLAGS = -ginkgo.v --ginkgo.timeout=180m
 GO111MODULE = on
 GOPATH ?= $(shell go env GOPATH)
 GOBIN ?= $(GOPATH)/bin
@@ -42,22 +48,24 @@ ALL_OS = linux windows
 ALL_ARCH.linux = amd64 arm64
 ALL_OS_ARCH.linux = $(foreach arch, ${ALL_ARCH.linux}, linux-$(arch))
 ALL_ARCH.windows = amd64
-ALL_OSVERSIONS.windows := 1809 1903 1909 2004
+ALL_OSVERSIONS.windows := 1809 ltsc2022
 ALL_OS_ARCH.windows = $(foreach arch, $(ALL_ARCH.windows), $(foreach osversion, ${ALL_OSVERSIONS.windows}, windows-${osversion}-${arch}))
 ALL_OS_ARCH = $(foreach os, $(ALL_OS), ${ALL_OS_ARCH.${os}})
 
 # The current context of image building
 # The architecture of the image
 ARCH ?= amd64
-# OS Version for the Windows images: 1809, 1903, 1909, 2004
+# OS Version for the Windows images: 1809 ltsc2022
 OSVERSION ?= 1809
 # Output type of docker buildx build
 OUTPUT_TYPE ?= registry
+# Set -short to skip cloud provider tests
+UNIT_TEST_ARGS ?=
 
 .EXPORT_ALL_VARIABLES:
 
 .PHONY: all
-all: azurefile
+all: azurefile azurefile-proxy
 
 .PHONY: update
 update:
@@ -70,36 +78,38 @@ verify: unit-test
 
 .PHONY: unit-test
 unit-test:
-	go test -v -race ./pkg/... ./test/utils/credentials
+	go test -v -race $(UNIT_TEST_ARGS) ./pkg/... ./test/utils/credentials -timeout=30m
 
 .PHONY: sanity-test
 sanity-test: azurefile
-	go test -v -timeout=10m ./test/sanity
-
-.PHONY: integration-test
-integration-test: azurefile
-	go test -v -timeout=10m ./test/integration
+	go test -v -timeout=30m ./test/sanity
 
 .PHONY: e2e-test
 e2e-test:
 	if [ ! -z "$(EXTERNAL_E2E_TEST_SMB)" ] || [ ! -z "$(EXTERNAL_E2E_TEST_NFS)" ]; then \
 		bash ./test/external-e2e/run.sh;\
 	else \
-		go test -v -timeout=0 ./test/e2e ${GINKGO_FLAGS};\
+		bash ./hack/parse-prow-creds.sh;\
+		go test -v -timeout=180m ./test/e2e ${GINKGO_FLAGS};\
 	fi
 
 .PHONY: e2e-bootstrap
 e2e-bootstrap: install-helm
-	docker pull $(IMAGE_TAG) || make container-all push-manifest
+ifdef WINDOWS_USE_HOST_PROCESS_CONTAINERS
+	(docker pull $(CSI_IMAGE_TAG) && docker pull $(CSI_IMAGE_TAG)-windows-hp) || make container-all push-manifest
+else
+	docker pull $(CSI_IMAGE_TAG) || make container-all push-manifest
+endif
 ifdef TEST_WINDOWS
 	helm install azurefile-csi-driver charts/latest/azurefile-csi-driver --namespace kube-system --wait --timeout=15m -v=5 --debug \
 		${E2E_HELM_OPTIONS} \
 		--set windows.enabled=true \
+		--set windows.useHostProcessContainers=${WINDOWS_USE_HOST_PROCESS_CONTAINERS} \
 		--set linux.enabled=false \
-		--set controller.runOnMaster=true \
+		--set driver.azureGoSDKLogLevel=INFO \
 		--set controller.replicas=1 \
 		--set controller.logLevel=6 \
-		--set node.logLevel=6
+		--set node.logLevel=10
 else
 	helm install azurefile-csi-driver charts/latest/azurefile-csi-driver --namespace kube-system --wait --timeout=15m -v=5 --debug \
 		${E2E_HELM_OPTIONS} \
@@ -115,7 +125,7 @@ e2e-teardown:
 	helm delete azurefile-csi-driver --namespace kube-system
 
 .PHONY: azurefile
-azurefile:
+azurefile: azurefile-proxy
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -a -ldflags ${LDFLAGS} -mod vendor -o _output/${ARCH}/azurefileplugin ./pkg/azurefileplugin
 
 .PHONY: azurefile-windows
@@ -127,19 +137,39 @@ azurefile-darwin:
 	CGO_ENABLED=0 GOOS=darwin go build -a -ldflags ${LDFLAGS} -mod vendor -o _output/${ARCH}/azurefileplugin ./pkg/azurefileplugin
 
 .PHONY: container
-container: azurefile
-	docker build --no-cache -t $(IMAGE_TAG) --output=type=docker -f ./pkg/azurefileplugin/Dockerfile .
+container: azurefile azurefile-proxy
+	docker build --no-cache -t $(CSI_IMAGE_TAG) --output=type=docker -f ./pkg/azurefileplugin/Dockerfile .
 
 .PHONY: container-linux
 container-linux:
 	docker buildx build --pull --output=type=$(OUTPUT_TYPE) --platform="linux/$(ARCH)" \
-		-t $(IMAGE_TAG)-linux-$(ARCH) --build-arg ARCH=${ARCH} -f ./pkg/azurefileplugin/Dockerfile .
+		--provenance=false --sbom=false \
+		-t $(CSI_IMAGE_TAG)-linux-$(ARCH) --build-arg ARCH=${ARCH} -f ./pkg/azurefileplugin/Dockerfile .
 
 .PHONY: container-windows
 container-windows:
 	docker buildx build --pull --output=type=$(OUTPUT_TYPE) --platform="windows/$(ARCH)" \
-		-t $(IMAGE_TAG)-windows-$(OSVERSION)-$(ARCH) --build-arg OSVERSION=$(OSVERSION) \
+		-t $(CSI_IMAGE_TAG)-windows-$(OSVERSION)-$(ARCH) --build-arg OSVERSION=$(OSVERSION) \
+		--provenance=false --sbom=false \
 		--build-arg ARCH=${ARCH} -f ./pkg/azurefileplugin/Windows.Dockerfile .
+# workaround: only build hostprocess image once
+ifdef WINDOWS_USE_HOST_PROCESS_CONTAINERS
+ifeq ($(OSVERSION),ltsc2022)
+	$(MAKE) container-windows-hostprocess
+	$(MAKE) container-windows-hostprocess-latest
+endif
+endif
+
+# Set --provenance=false to not generate the provenance (which is what causes the multi-platform index to be generated, even for a single platform).
+.PHONY: container-windows-hostprocess
+container-windows-hostprocess:
+	docker buildx build --pull --output=type=$(OUTPUT_TYPE) --platform="windows/$(ARCH)" --provenance=false --sbom=false \
+		-t $(CSI_IMAGE_TAG)-windows-hp -f ./pkg/azurefileplugin/WindowsHostProcess.Dockerfile .
+
+.PHONY: container-windows-hostprocess-latest
+container-windows-hostprocess-latest:
+	docker buildx build --pull --output=type=$(OUTPUT_TYPE) --platform="windows/$(ARCH)" --provenance=false --sbom=false \
+		-t $(CSI_IMAGE_TAG_LATEST)-windows-hp -f ./pkg/azurefileplugin/WindowsHostProcess.Dockerfile .
 
 .PHONY: container-all
 container-all: azurefile-windows
@@ -159,36 +189,40 @@ container-all: azurefile-windows
 
 .PHONY: push-manifest
 push-manifest:
-	docker manifest create --amend $(IMAGE_TAG) $(foreach osarch, $(ALL_OS_ARCH), $(IMAGE_TAG)-${osarch})
+	docker manifest create --amend $(CSI_IMAGE_TAG) $(foreach osarch, $(ALL_OS_ARCH), $(CSI_IMAGE_TAG)-${osarch})
 	set -x; \
 	for arch in $(ALL_ARCH.windows); do \
 		for osversion in $(ALL_OSVERSIONS.windows); do \
 			BASEIMAGE=mcr.microsoft.com/windows/nanoserver:$${osversion}; \
 			full_version=`docker manifest inspect $${BASEIMAGE} | jq -r '.manifests[0].platform["os.version"]'`; \
-			docker manifest annotate --os windows --arch $${arch} --os-version $${full_version} $(IMAGE_TAG) $(IMAGE_TAG)-windows-$${osversion}-$${arch}; \
+			docker manifest annotate --os windows --arch $${arch} --os-version $${full_version} $(CSI_IMAGE_TAG) $(CSI_IMAGE_TAG)-windows-$${osversion}-$${arch}; \
 		done; \
 	done
-	docker manifest push --purge $(IMAGE_TAG)
-	docker manifest inspect $(IMAGE_TAG)
+	docker manifest push --purge $(CSI_IMAGE_TAG)
+	docker manifest inspect $(CSI_IMAGE_TAG)
 ifdef PUBLISH
-	docker manifest create $(IMAGE_TAG_LATEST) $(foreach osarch, $(ALL_OS_ARCH), $(IMAGE_TAG)-${osarch})
+	docker manifest create --amend $(CSI_IMAGE_TAG_LATEST) $(foreach osarch, $(ALL_OS_ARCH), $(CSI_IMAGE_TAG)-${osarch})
 	set -x; \
 	for arch in $(ALL_ARCH.windows); do \
 		for osversion in $(ALL_OSVERSIONS.windows); do \
 			BASEIMAGE=mcr.microsoft.com/windows/nanoserver:$${osversion}; \
 			full_version=`docker manifest inspect $${BASEIMAGE} | jq -r '.manifests[0].platform["os.version"]'`; \
-			docker manifest annotate --os windows --arch $${arch} --os-version $${full_version} $(IMAGE_TAG_LATEST) $(IMAGE_TAG)-windows-$${osversion}-$${arch}; \
+			docker manifest annotate --os windows --arch $${arch} --os-version $${full_version} $(CSI_IMAGE_TAG_LATEST) $(CSI_IMAGE_TAG)-windows-$${osversion}-$${arch}; \
 		done; \
 	done
-	docker manifest inspect $(IMAGE_TAG_LATEST)
+	docker manifest inspect $(CSI_IMAGE_TAG_LATEST)
+	docker manifest create --amend $(CSI_IMAGE_TAG_LATEST)-windows-hp $(CSI_IMAGE_TAG_LATEST)-windows-hp
+	docker manifest inspect $(CSI_IMAGE_TAG_LATEST)-windows-hp
 endif
 
 .PHONY: push-latest
 push-latest:
 ifdef CI
-	docker manifest push --purge $(IMAGE_TAG_LATEST)
+	docker manifest push --purge $(CSI_IMAGE_TAG_LATEST)
+	docker manifest push --purge $(CSI_IMAGE_TAG_LATEST)-windows-hp
 else
-	docker push $(IMAGE_TAG_LATEST)
+	docker push $(CSI_IMAGE_TAG_LATEST)
+	docker push $(CSI_IMAGE_TAG_LATEST)-windows-hp
 endif
 
 .PHONY: clean
@@ -202,10 +236,14 @@ create-metrics-svc:
 
 .PHONY: install-smb-provisioner
 install-smb-provisioner:
-	kubectl delete secret smbcreds --ignore-not-found
-	kubectl create secret generic smbcreds --from-literal azurestorageaccountname=USERNAME --from-literal azurestorageaccountkey="PASSWORD"
+	kubectl delete secret smbcreds -n default --ignore-not-found
+	kubectl create secret generic smbcreds -n default --from-literal azurestorageaccountname=USERNAME --from-literal azurestorageaccountkey="PASSWORD"
 ifdef TEST_WINDOWS
 	kubectl apply -f deploy/example/smb-provisioner/smb-server-lb.yaml
 else
 	kubectl apply -f deploy/example/smb-provisioner/smb-server.yaml
 endif
+
+.PHONY: azurefile-proxy
+azurefile-proxy:
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -mod vendor -ldflags="-s -w" -o _output/${ARCH}/azurefile-proxy ./pkg/azurefile-proxy

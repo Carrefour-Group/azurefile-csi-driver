@@ -17,11 +17,16 @@ limitations under the License.
 package testsuites
 
 import (
+	"context"
+	"fmt"
+	"time"
+
 	"sigs.k8s.io/azurefile-csi-driver/test/e2e/driver"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 )
 
 // DynamicallyProvisionedCmdVolumeTest will provision required StorageClass(es), PVC(s) and Pod(s)
@@ -31,20 +36,31 @@ type DynamicallyProvisionedCmdVolumeTest struct {
 	CSIDriver              driver.DynamicPVTestDriver
 	Pods                   []PodDetails
 	StorageClassParameters map[string]string
+	ServiceAccountName     string
 }
 
-func (t *DynamicallyProvisionedCmdVolumeTest) Run(client clientset.Interface, namespace *v1.Namespace) {
+func (t *DynamicallyProvisionedCmdVolumeTest) Run(ctx context.Context, client clientset.Interface, namespace *v1.Namespace) {
 	for _, pod := range t.Pods {
-		tpod, cleanup := pod.SetupWithDynamicVolumes(client, namespace, t.CSIDriver, t.StorageClassParameters)
+		tpod, cleanup := pod.SetupWithDynamicVolumes(ctx, client, namespace, t.CSIDriver, t.StorageClassParameters)
 		// defer must be called here for resources not get removed before using them
 		for i := range cleanup {
-			defer cleanup[i]()
+			defer cleanup[i](ctx)
+		}
+
+		if t.ServiceAccountName != "" {
+			tpod.SetServiceAccountName(t.ServiceAccountName)
+			// Note: AutomountServiceAccountToken is intentionally left false (default).
+			// CSI tokenRequests for workload identity are handled by kubelet based on the
+			// pod's service account; no in-container token mount is needed.
 		}
 
 		ginkgo.By("deploying the pod")
-		tpod.Create()
-		defer tpod.Cleanup()
+		tpod.Create(ctx)
+		defer tpod.Cleanup(ctx)
 		ginkgo.By("checking that the pods command exits with no error")
-		tpod.WaitForSuccess()
+		if err := e2epod.WaitForPodSuccessInNamespaceTimeout(ctx, tpod.client, tpod.pod.Name, tpod.namespace.Name, 15*time.Minute); err != nil {
+			ginkgo.By(fmt.Sprintf("hit error(%v) in first run, give another try", err))
+		}
+		tpod.WaitForSuccess(ctx)
 	}
 }

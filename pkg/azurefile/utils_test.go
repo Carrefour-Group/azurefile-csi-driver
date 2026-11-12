@@ -17,14 +17,24 @@ limitations under the License.
 package azurefile
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/stretchr/testify/assert"
+	nodev1 "k8s.io/api/node/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	fake "k8s.io/client-go/kubernetes/fake"
 	utiltesting "k8s.io/client-go/util/testing"
+	"k8s.io/kubernetes/pkg/volume"
+	azureconfig "sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 )
 
 func TestSimpleLockEntry(t *testing.T) {
@@ -61,7 +71,7 @@ func TestConcurrentLockEntry(t *testing.T) {
 	testLockMap.UnlockEntry("entry1")
 }
 
-func (lm *lockMap) lockAndCallback(t *testing.T, entry string, callbackChan chan<- interface{}) {
+func (lm *lockMap) lockAndCallback(_ *testing.T, entry string, callbackChan chan<- interface{}) {
 	lm.LockEntry(entry)
 	callbackChan <- true
 }
@@ -142,6 +152,53 @@ func TestIsDiskFsType(t *testing.T) {
 	}
 }
 
+func TestIsSupportedShareNamePrefix(t *testing.T) {
+	tests := []struct {
+		prefix         string
+		expectedResult bool
+	}{
+		{
+			prefix:         "",
+			expectedResult: true,
+		},
+		{
+			prefix:         "ext3",
+			expectedResult: true,
+		},
+		{
+			prefix:         "ext-2",
+			expectedResult: true,
+		},
+		{
+			prefix:         "-xfs",
+			expectedResult: false,
+		},
+		{
+			prefix:         "Absdf",
+			expectedResult: false,
+		},
+		{
+			prefix:         "tooooooooooooooooooooooooolong",
+			expectedResult: false,
+		},
+		{
+			prefix:         "+invalid",
+			expectedResult: false,
+		},
+		{
+			prefix:         " invalidspace",
+			expectedResult: false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedShareNamePrefix(test.prefix)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedShareNamePrefix(%s) returned with %v, not equal to %v", test.prefix, result, test.expectedResult)
+		}
+	}
+}
+
 func TestIsSupportedFsType(t *testing.T) {
 	tests := []struct {
 		fsType         string
@@ -189,6 +246,45 @@ func TestIsSupportedFsType(t *testing.T) {
 	}
 }
 
+func TestIsSupportedFSGroupChangePolicy(t *testing.T) {
+	tests := []struct {
+		policy         string
+		expectedResult bool
+	}{
+		{
+			policy:         "",
+			expectedResult: true,
+		},
+		{
+			policy:         "None",
+			expectedResult: true,
+		},
+		{
+			policy:         "Always",
+			expectedResult: true,
+		},
+		{
+			policy:         "OnRootMismatch",
+			expectedResult: true,
+		},
+		{
+			policy:         "onRootMismatch",
+			expectedResult: false,
+		},
+		{
+			policy:         "invalid",
+			expectedResult: false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedFSGroupChangePolicy(test.policy)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedFSGroupChangePolicy(%s) returned with %v, not equal to %v", test.policy, result, test.expectedResult)
+		}
+	}
+}
+
 func TestIsRetriableError(t *testing.T) {
 	tests := []struct {
 		desc         string
@@ -231,6 +327,132 @@ func TestIsRetriableError(t *testing.T) {
 	}
 }
 
+func TestClassifyMountError(t *testing.T) {
+	tests := []struct {
+		desc     string
+		err      error
+		expected string
+	}{
+		{
+			desc:     "nil error",
+			err:      nil,
+			expected: "",
+		},
+		{
+			desc:     "timed out",
+			err:      errors.New("mount.cifs: mount error(110): Connection timed out"),
+			expected: mountErrorTimeout,
+		},
+		{
+			desc:     "generic timeout keyword",
+			err:      errors.New("context deadline exceeded: operation timeout"),
+			expected: mountErrorTimeout,
+		},
+		{
+			desc:     "proxy grpc deadline exceeded (no timeout keyword)",
+			err:      errors.New("rpc error: code = DeadlineExceeded desc = context deadline exceeded"),
+			expected: mountErrorTimeout,
+		},
+		{
+			desc:     "permission denied",
+			err:      errors.New("mount error: Permission denied"),
+			expected: mountErrorAccessDenied,
+		},
+		{
+			desc:     "cifs error(13)",
+			err:      errors.New("mount.cifs: mount error(13): Permission denied"),
+			expected: mountErrorAccessDenied,
+		},
+		{
+			desc:     "nfs access denied by server",
+			err:      errors.New("mount.nfs: access denied by server while mounting server:/share"),
+			expected: mountErrorAccessDenied,
+		},
+		{
+			desc:     "no such file or directory (transient SMB enoent)",
+			err:      errors.New("mount: no such file or directory"),
+			expected: mountErrorENOENT,
+		},
+		{
+			desc:     "cifs error(2)",
+			err:      errors.New("mount.cifs: mount error(2): No such file or directory"),
+			expected: mountErrorENOENT,
+		},
+		{
+			desc:     "device or resource busy",
+			err:      errors.New("mount.cifs: mount error(16): Device or resource busy"),
+			expected: mountErrorBusy,
+		},
+		{
+			desc:     "target is busy",
+			err:      errors.New("unmount failed: target is busy"),
+			expected: mountErrorBusy,
+		},
+		{
+			desc:     "connection reset",
+			err:      errors.New("read: connection reset by peer"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "host is down",
+			err:      errors.New("mount.cifs: host is down"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "no route to host",
+			err:      errors.New("connect: no route to host"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "connection refused",
+			err:      errors.New("dial tcp: connection refused"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "cifs error(111)",
+			err:      errors.New("mount.cifs: mount error(111): Connection refused"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "cifs error(101) network is unreachable",
+			err:      errors.New("mount.cifs: mount error(101): Network is unreachable"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "cifs could not connect / unable to find suitable address",
+			err:      errors.New("mount error(113): could not connect to 10.0.0.4\nUnable to find suitable address"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "cifs error(115) EINPROGRESS during connect",
+			err:      errors.New("mount.cifs: mount error(115): Operation now in progress"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "dns resolution failure (getaddrinfo)",
+			err:      errors.New("mount error: could not resolve address for nonexistentacct.file.core.windows.net: Unknown error"),
+			expected: mountErrorNetwork,
+		},
+		{
+			desc:     "status codes only in dmesg fall through to other",
+			err:      errors.New("cifs: STATUS_LOGON_FAILURE"),
+			expected: mountErrorOther,
+		},
+		{
+			desc:     "unclassified error",
+			err:      errors.New("some unexpected failure"),
+			expected: mountErrorOther,
+		},
+	}
+
+	for _, test := range tests {
+		if result := classifyMountError(test.err); result != test.expected {
+			t.Errorf("desc: (%s), input: err(%v), classifyMountError returned (%q), expected (%q)",
+				test.desc, test.err, result, test.expected)
+		}
+	}
+}
+
 func TestSleepIfThrottled(t *testing.T) {
 	start := time.Now()
 	sleepIfThrottled(errors.New("tooManyRequests"), 10)
@@ -238,14 +460,47 @@ func TestSleepIfThrottled(t *testing.T) {
 	if elapsed.Seconds() < 10 {
 		t.Errorf("Expected sleep time(%d), Actual sleep time(%f)", 10, elapsed.Seconds())
 	}
-
 }
 
-func TestUseDataPlaneAPI(t *testing.T) {
-	volumeContext := map[string]string{"usedataplaneapi": "true"}
-	result := useDataPlaneAPI(volumeContext)
-	if result != true {
-		t.Errorf("Expected value(%s), Actual value(%t)", "true", result)
+func TestGetRetryAfterSeconds(t *testing.T) {
+	tests := []struct {
+		desc     string
+		err      error
+		expected int
+	}{
+		{
+			desc:     "nil error",
+			err:      nil,
+			expected: 0,
+		},
+		{
+			desc:     "no match",
+			err:      errors.New("no match"),
+			expected: 0,
+		},
+		{
+			desc:     "match",
+			err:      errors.New("RetryAfter: 10s"),
+			expected: 10,
+		},
+		{
+			desc:     "match error message",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 217s, HTTPStatusCode: 0, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"client throttled\""),
+			expected: 217,
+		},
+		{
+			desc:     "match error message exceeds 1200s",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 2170s, HTTPStatusCode: 0, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"client throttled\""),
+			expected: maxThrottlingSleepSec,
+		},
+	}
+
+	for _, test := range tests {
+		result := getRetryAfterSeconds(test.err)
+		if result != test.expected {
+			t.Errorf("desc: (%s), input: err(%v), getRetryAfterSeconds returned with int(%d), not equal to expected(%d)",
+				test.desc, test.err, result, test.expected)
+		}
 	}
 }
 
@@ -260,27 +515,156 @@ func TestConvertTagsToMap(t *testing.T) {
 	tests := []struct {
 		desc          string
 		tags          string
+		tagsDelimiter string
 		expectedError error
 	}{
-		{desc: "Invalid tag",
-			tags:          "invalid=test=tag",
-			expectedError: errors.New("Tags 'invalid=test=tag' are invalid, the format should like: 'key1=value1,key2=value2'"),
+		{
+			desc:          "Invalid tag",
+			tags:          "invalid,test,tag",
+			tagsDelimiter: ",",
+			expectedError: errors.New("Tags 'invalid,test,tag' are invalid, the format should like: 'key1=value1,key2=value2'"),
 		},
-		{desc: "Invalid key",
+		{
+			desc:          "Invalid key",
 			tags:          "=test",
+			tagsDelimiter: ",",
 			expectedError: errors.New("Tags '=test' are invalid, the format should like: 'key1=value1,key2=value2'"),
 		},
-		{desc: "Valid tags",
+		{
+			desc:          "Valid tags",
 			tags:          "testTag=testValue",
-			expectedError: nil},
+			tagsDelimiter: ",",
+			expectedError: nil,
+		},
+		{
+			desc:          "should return success for empty tagsDelimiter",
+			tags:          "key1=value1,key2=value2",
+			tagsDelimiter: "",
+			expectedError: nil,
+		},
+		{
+			desc:          "should return success for special tagsDelimiter and tag values containing commas and equal sign",
+			tags:          "key1=aGVsbG8=;key2=value-2, value-3",
+			tagsDelimiter: ";",
+			expectedError: nil,
+		},
 	}
 
 	for _, test := range tests {
-		_, err := ConvertTagsToMap(test.tags)
+		_, err := ConvertTagsToMap(test.tags, test.tagsDelimiter)
 		if !reflect.DeepEqual(err, test.expectedError) {
 			t.Errorf("test[%s]: unexpected error: %v, expected error: %v", test.desc, err, test.expectedError)
 		}
 	}
+}
+
+func TestChmodIfPermissionMismatch(t *testing.T) {
+	skipIfTestingOnWindows(t)
+	permissionMatchingPath, _ := getWorkDirPath("permissionMatchingPath")
+	_ = makeDir(permissionMatchingPath, 0755)
+	_ = os.Chmod(permissionMatchingPath, 0755&^os.ModeSetgid) // clear setgid bit
+	defer os.RemoveAll(permissionMatchingPath)
+
+	permissionMismatchPath, _ := getWorkDirPath("permissionMismatchPath")
+	_ = makeDir(permissionMismatchPath, 0721)
+	_ = os.Chmod(permissionMismatchPath, 0721&^os.ModeSetgid) // clear setgid bit
+	defer os.RemoveAll(permissionMismatchPath)
+
+	permissionMatchGidMismatchPath, _ := getWorkDirPath("permissionMatchGidMismatchPath")
+	_ = makeDir(permissionMatchGidMismatchPath, 0755)
+	_ = os.Chmod(permissionMatchGidMismatchPath, 0755|os.ModeSetgid) // Setgid bit is set
+	defer os.RemoveAll(permissionMatchGidMismatchPath)
+
+	permissionMismatchGidMismatch, _ := getWorkDirPath("permissionMismatchGidMismatch")
+	_ = makeDir(permissionMismatchGidMismatch, 0721)
+	_ = os.Chmod(permissionMismatchGidMismatch, 0721|os.ModeSetgid) // Setgid bit is set
+	defer os.RemoveAll(permissionMismatchGidMismatch)
+
+	tests := []struct {
+		desc           string
+		path           string
+		mode           os.FileMode
+		expectedPerms  os.FileMode
+		expectedGidBit bool
+		expectedError  error
+	}{
+		{
+			desc:          "Invalid path",
+			path:          "invalid-path",
+			mode:          0755,
+			expectedError: fmt.Errorf("CreateFile invalid-path: The system cannot find the file specified"),
+		},
+		{
+			desc:           "permission matching path",
+			path:           permissionMatchingPath,
+			mode:           0755,
+			expectedPerms:  0755,
+			expectedGidBit: false,
+			expectedError:  nil,
+		},
+		{
+			desc:           "permission mismatch path",
+			path:           permissionMismatchPath,
+			mode:           0755,
+			expectedPerms:  0755,
+			expectedGidBit: false,
+			expectedError:  nil,
+		},
+		{
+			desc:           "only match the permission mode bits",
+			path:           permissionMatchGidMismatchPath,
+			mode:           0755,
+			expectedPerms:  0755,
+			expectedGidBit: true,
+			expectedError:  nil,
+		},
+		{
+			desc:           "only change the permission mode bits when gid is set",
+			path:           permissionMismatchGidMismatch,
+			mode:           0755,
+			expectedPerms:  0755,
+			expectedGidBit: true,
+			expectedError:  nil,
+		},
+		{
+			desc:           "only change the permission mode bits when gid is not set but mode bits have gid set",
+			path:           permissionMismatchPath,
+			mode:           02755,
+			expectedPerms:  0755,
+			expectedGidBit: false,
+			expectedError:  nil,
+		},
+	}
+
+	for _, test := range tests {
+		err := chmodIfPermissionMismatch(test.path, test.mode)
+		if !reflect.DeepEqual(err, test.expectedError) {
+			if err == nil || test.expectedError == nil && !strings.Contains(err.Error(), test.expectedError.Error()) {
+				t.Errorf("test[%s]: unexpected error: %v, expected error: %v", test.desc, err, test.expectedError)
+			}
+		}
+
+		if test.expectedError == nil {
+			info, _ := os.Lstat(test.path)
+			if test.expectedError == nil && (info.Mode()&os.ModePerm != test.expectedPerms) {
+				t.Errorf("test[%s]: unexpected perms: %v, expected perms: %v, ", test.desc, info.Mode()&os.ModePerm, test.expectedPerms)
+			}
+
+			if (info.Mode()&os.ModeSetgid != 0) != test.expectedGidBit {
+				t.Errorf("test[%s]: unexpected gid bit: %v, expected gid bit: %v", test.desc, info.Mode()&os.ModeSetgid != 0, test.expectedGidBit)
+			}
+		}
+
+	}
+}
+
+// getWorkDirPath returns the path to the current working directory
+func getWorkDirPath(dir string) (string, error) {
+	path, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s%c%s", path, os.PathSeparator, dir), nil
 }
 
 func TestSetVolumeOwnership(t *testing.T) {
@@ -292,9 +676,10 @@ func TestSetVolumeOwnership(t *testing.T) {
 	defer os.RemoveAll(tmpVDir)
 
 	tests := []struct {
-		path          string
-		gid           string
-		expectedError error
+		path                string
+		gid                 string
+		fsGroupChangePolicy string
+		expectedError       error
 	}{
 		{
 			path:          "path",
@@ -316,12 +701,1321 @@ func TestSetVolumeOwnership(t *testing.T) {
 			gid:           "1000",
 			expectedError: nil,
 		},
+		{
+			path:                tmpVDir,
+			gid:                 "1000",
+			fsGroupChangePolicy: "Always",
+			expectedError:       nil,
+		},
+		{
+			path:                tmpVDir,
+			gid:                 "1000",
+			fsGroupChangePolicy: "OnRootMismatch",
+			expectedError:       nil,
+		},
 	}
 
 	for _, test := range tests {
-		err := SetVolumeOwnership(test.path, test.gid)
+		err := SetVolumeOwnership(test.path, test.gid, test.fsGroupChangePolicy)
 		if err != nil && (err.Error() != test.expectedError.Error()) {
 			t.Errorf("unexpected error: %v, expected error: %v", err, test.expectedError)
 		}
+	}
+}
+
+func TestSetKeyValueInMap(t *testing.T) {
+	tests := []struct {
+		desc     string
+		m        map[string]string
+		key      string
+		value    string
+		expected map[string]string
+	}{
+		{
+			desc:  "nil map",
+			key:   "key",
+			value: "value",
+		},
+		{
+			desc:     "empty map",
+			m:        map[string]string{},
+			key:      "key",
+			value:    "value",
+			expected: map[string]string{"key": "value"},
+		},
+		{
+			desc:  "non-empty map",
+			m:     map[string]string{"k": "v"},
+			key:   "key",
+			value: "value",
+			expected: map[string]string{
+				"k":   "v",
+				"key": "value",
+			},
+		},
+		{
+			desc:     "same key already exists",
+			m:        map[string]string{"subDir": "value2"},
+			key:      "subDir",
+			value:    "value",
+			expected: map[string]string{"subDir": "value"},
+		},
+		{
+			desc:     "case insensitive key already exists",
+			m:        map[string]string{"subDir": "value2"},
+			key:      "subdir",
+			value:    "value",
+			expected: map[string]string{"subdir": "value"},
+		},
+		{
+			desc:     "Unicode case insensitive key already exists",
+			m:        map[string]string{"\u017fecretNamespace": "value2"},
+			key:      secretNamespaceField,
+			value:    "value",
+			expected: map[string]string{secretNamespaceField: "value"},
+		},
+		{
+			desc: "all case insensitive aliases are replaced",
+			m: map[string]string{
+				secretNamespaceField:   "value1",
+				"SecretNamespace":      "value2",
+				"\u017fecretNamespace": "value3",
+				shareNameField:         "share",
+			},
+			key:   secretNamespaceField,
+			value: "value",
+			expected: map[string]string{
+				secretNamespaceField: "value",
+				shareNameField:       "share",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		setKeyValueInMap(test.m, test.key, test.value)
+		if !reflect.DeepEqual(test.m, test.expected) {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, test.m, test.expected)
+		}
+	}
+}
+
+func TestGetValueInMap(t *testing.T) {
+	tests := []struct {
+		desc     string
+		m        map[string]string
+		key      string
+		expected string
+	}{
+		{
+			desc:     "nil map",
+			key:      "key",
+			expected: "",
+		},
+		{
+			desc:     "empty map",
+			m:        map[string]string{},
+			key:      "key",
+			expected: "",
+		},
+		{
+			desc:     "non-empty map",
+			m:        map[string]string{"k": "v"},
+			key:      "key",
+			expected: "",
+		},
+		{
+			desc:     "same key already exists",
+			m:        map[string]string{"subDir": "value2"},
+			key:      "subDir",
+			expected: "value2",
+		},
+		{
+			desc:     "case insensitive key already exists",
+			m:        map[string]string{"subDir": "value2"},
+			key:      "subdir",
+			expected: "value2",
+		},
+	}
+
+	for _, test := range tests {
+		result := getValueInMap(test.m, test.key)
+		if result != test.expected {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, result, test.expected)
+		}
+	}
+}
+
+func TestCaseCollidingKey(t *testing.T) {
+	tests := []struct {
+		desc         string
+		m            map[string]string
+		expectedKey  string
+		expectedColl bool
+	}{
+		{
+			desc:         "nil map",
+			expectedColl: false,
+		},
+		{
+			desc:         "no collision",
+			m:            map[string]string{"secretNamespace": "ns", "shareName": "share"},
+			expectedColl: false,
+		},
+		{
+			desc:         "secretNamespace case collision",
+			m:            map[string]string{"secretNamespace": "attacker", "SecretNamespace": "victim"},
+			expectedKey:  "secretnamespace, secretnamespace",
+			expectedColl: true,
+		},
+		{
+			desc:         "managed identity case collision",
+			m:            map[string]string{"mountwithmanagedidentity": "false", "MOUNTWITHMANAGEDIDENTITY": "true"},
+			expectedKey:  "mountwithmanagedidentity, mountwithmanagedidentity",
+			expectedColl: true,
+		},
+		{
+			desc:         "unicode collision",
+			m:            map[string]string{"mountoptions": "option1,option2", "mountoptionſ": "option3"},
+			expectedKey:  "mountoptions, mountoptionſ",
+			expectedColl: true,
+		},
+	}
+
+	for _, test := range tests {
+		key, ok := caseCollidingKey(test.m)
+		if ok != test.expectedColl {
+			t.Errorf("test[%s]: unexpected collision result: %v, expected: %v", test.desc, ok, test.expectedColl)
+		}
+		if ok && key != test.expectedKey {
+			t.Errorf("test[%s]: unexpected colliding key: %v, expected: %v", test.desc, key, test.expectedKey)
+		}
+	}
+}
+
+func TestGetServiceAccountTokens(t *testing.T) {
+	tests := []struct {
+		name          string
+		secrets       map[string]string
+		volumeContext map[string]string
+		expected      string
+	}{
+		{
+			name: "token from secrets field (new behavior)",
+			secrets: map[string]string{
+				serviceAccountTokenField: "token-from-secrets",
+			},
+			volumeContext: map[string]string{
+				serviceAccountTokenField: "token-from-context",
+			},
+			expected: "token-from-secrets",
+		},
+		{
+			name:    "token from volume context (backward compatible)",
+			secrets: map[string]string{},
+			volumeContext: map[string]string{
+				serviceAccountTokenField: "token-from-context",
+			},
+			expected: "token-from-context",
+		},
+		{
+			name:          "no token available",
+			secrets:       map[string]string{},
+			volumeContext: map[string]string{},
+			expected:      "",
+		},
+		{
+			name:    "nil secrets falls back to volume context",
+			secrets: nil,
+			volumeContext: map[string]string{
+				serviceAccountTokenField: "token-from-context",
+			},
+			expected: "token-from-context",
+		},
+		{
+			name: "nil volume context with secrets",
+			secrets: map[string]string{
+				serviceAccountTokenField: "token-from-secrets",
+			},
+			volumeContext: nil,
+			expected:      "token-from-secrets",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := getServiceAccountTokens(test.secrets, test.volumeContext)
+			assert.Equal(t, test.expected, result)
+		})
+	}
+}
+
+func TestHasStorageAccountCredentials(t *testing.T) {
+	tests := []struct {
+		name     string
+		secrets  map[string]string
+		expected bool
+	}{
+		{
+			name:     "nil secrets",
+			secrets:  nil,
+			expected: false,
+		},
+		{
+			name:     "empty secrets",
+			secrets:  map[string]string{},
+			expected: false,
+		},
+		{
+			name: "only SA token in secrets",
+			secrets: map[string]string{
+				serviceAccountTokenField: "some-token",
+			},
+			expected: false,
+		},
+		{
+			name: "storage account credentials in secrets",
+			secrets: map[string]string{
+				"accountname": "myaccount",
+				"accountkey":  "mykey",
+			},
+			expected: true,
+		},
+		{
+			name: "SA token plus storage credentials",
+			secrets: map[string]string{
+				serviceAccountTokenField: "some-token",
+				"accountname":            "myaccount",
+				"accountkey":             "mykey",
+			},
+			expected: true,
+		},
+		{
+			name: "unknown non-credential keys only",
+			secrets: map[string]string{
+				"some-future-kubelet-key": "value",
+			},
+			expected: false,
+		},
+		{
+			name: "azurestorageaccountname/azurestorageaccountkey (built-in plugin compatible)",
+			secrets: map[string]string{
+				"azurestorageaccountname": "myaccount",
+				"azurestorageaccountkey":  "mykey",
+			},
+			expected: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := hasStorageAccountCredentials(test.secrets)
+			assert.Equal(t, test.expected, result)
+		})
+	}
+}
+
+func TestReplaceWithMap(t *testing.T) {
+	tests := []struct {
+		desc     string
+		str      string
+		m        map[string]string
+		expected string
+	}{
+		{
+			desc:     "empty string",
+			str:      "",
+			expected: "",
+		},
+		{
+			desc:     "empty map",
+			str:      "",
+			m:        map[string]string{},
+			expected: "",
+		},
+		{
+			desc:     "empty key",
+			str:      "prefix-" + pvNameMetadata,
+			m:        map[string]string{"": "pv"},
+			expected: "prefix-" + pvNameMetadata,
+		},
+		{
+			desc:     "empty value",
+			str:      "prefix-" + pvNameMetadata,
+			m:        map[string]string{pvNameMetadata: ""},
+			expected: "prefix-",
+		},
+		{
+			desc:     "one replacement",
+			str:      "prefix-" + pvNameMetadata,
+			m:        map[string]string{pvNameMetadata: "pv"},
+			expected: "prefix-pv",
+		},
+		{
+			desc:     "multiple replacements",
+			str:      pvcNamespaceMetadata + pvcNameMetadata,
+			m:        map[string]string{pvcNamespaceMetadata: "namespace", pvcNameMetadata: "pvcname"},
+			expected: "namespacepvcname",
+		},
+	}
+
+	for _, test := range tests {
+		result := replaceWithMap(test.str, test.m)
+		if result != test.expected {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, result, test.expected)
+		}
+	}
+}
+
+func TestFolderNamePlaceholderExpansion(t *testing.T) {
+	tests := []struct {
+		desc       string
+		folderName string
+		replaceMap map[string]string
+		expected   string
+	}{
+		{
+			desc:       "expand all placeholders in folderName",
+			folderName: pvcNamespaceMetadata + "/" + pvcNameMetadata + "/" + pvNameMetadata,
+			replaceMap: map[string]string{
+				pvcNamespaceMetadata: "test-ns",
+				pvcNameMetadata:      "test-pvc",
+				pvNameMetadata:       "test-pv",
+			},
+			expected: "test-ns/test-pvc/test-pv",
+		},
+		{
+			desc:       "expand partial placeholders",
+			folderName: "static-prefix/" + pvcNameMetadata,
+			replaceMap: map[string]string{
+				pvcNameMetadata: "my-pvc",
+			},
+			expected: "static-prefix/my-pvc",
+		},
+		{
+			desc:       "no placeholders in folderName",
+			folderName: "static-folder/subfolder",
+			replaceMap: map[string]string{
+				pvcNameMetadata: "my-pvc",
+			},
+			expected: "static-folder/subfolder",
+		},
+		{
+			desc:       "empty folderName",
+			folderName: "",
+			replaceMap: map[string]string{
+				pvcNameMetadata: "my-pvc",
+			},
+			expected: "",
+		},
+		{
+			desc:       "empty replaceMap",
+			folderName: pvcNameMetadata + "/" + pvNameMetadata,
+			replaceMap: map[string]string{},
+			expected:   pvcNameMetadata + "/" + pvNameMetadata,
+		},
+	}
+
+	for _, test := range tests {
+		result := replaceWithMap(test.folderName, test.replaceMap)
+		if result != test.expected {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, result, test.expected)
+		}
+	}
+}
+
+func TestIsReadOnlyFromCapability(t *testing.T) {
+	testCases := []struct {
+		name           string
+		vc             *csi.VolumeCapability
+		expectedResult bool
+	}{
+		{
+			name:           "false with empty capabilities",
+			vc:             &csi.VolumeCapability{},
+			expectedResult: false,
+		},
+		{
+			name: "fail with capabilities no access mode",
+			vc: &csi.VolumeCapability{
+				AccessType: &csi.VolumeCapability_Mount{
+					Mount: &csi.VolumeCapability_MountVolume{},
+				},
+			},
+		},
+		{
+			name: "false with SINGLE_NODE_WRITER capabilities",
+			vc: &csi.VolumeCapability{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+			expectedResult: false,
+		},
+		{
+			name: "true with MULTI_NODE_READER_ONLY capabilities",
+			vc: &csi.VolumeCapability{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+				},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "true with SINGLE_NODE_READER_ONLY capabilities",
+			vc: &csi.VolumeCapability{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
+				},
+			},
+			expectedResult: true,
+		},
+	}
+
+	for _, test := range testCases {
+		result := isReadOnlyFromCapability(test.vc)
+		if result != test.expectedResult {
+			t.Errorf("case(%s): isReadOnlyFromCapability returned with %v, not equal to %v", test.name, result, test.expectedResult)
+		}
+	}
+}
+
+func TestIsConfidentialRuntimeClass(t *testing.T) {
+	ctx := context.TODO()
+
+	// Test the case where kubeClient is nil
+	_, err := isConfidentialRuntimeClass(ctx, nil, "test-runtime-class", defaultRuntimeClassHandler)
+	if err == nil || err.Error() != "kubeClient is nil" {
+		t.Fatalf("expected error 'kubeClient is nil', got %v", err)
+	}
+
+	// Create a fake clientset
+	clientset := fake.NewSimpleClientset()
+
+	// Test the case where the runtime class exists and has the confidential handler
+	runtimeClass := &nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-runtime-class",
+		},
+		Handler: defaultRuntimeClassHandler,
+	}
+	_, err = clientset.NodeV1().RuntimeClasses().Create(ctx, runtimeClass, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	isConfidential, err := isConfidentialRuntimeClass(ctx, clientset, "test-runtime-class", defaultRuntimeClassHandler)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if !isConfidential {
+		t.Fatalf("expected runtime class to be confidential, got %v", isConfidential)
+	}
+
+	// Test the case where the runtime class exists but does not have the confidential handler
+	nonConfidentialRuntimeClass := &nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-runtime-class-non-confidential",
+		},
+		Handler: "non-confidential-handler",
+	}
+	_, err = clientset.NodeV1().RuntimeClasses().Create(ctx, nonConfidentialRuntimeClass, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	isConfidential, err = isConfidentialRuntimeClass(ctx, clientset, "test-runtime-class-non-confidential", defaultRuntimeClassHandler)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if isConfidential {
+		t.Fatalf("expected runtime class to not be confidential, got %v", isConfidential)
+	}
+
+	// Test the case where the runtime class does not exist
+	_, err = isConfidentialRuntimeClass(ctx, clientset, "nonexistent-runtime-class", defaultRuntimeClassHandler)
+	if err == nil {
+		t.Fatalf("expected an error, got nil")
+	}
+}
+
+func TestIsThrottlingError(t *testing.T) {
+	tests := []struct {
+		desc     string
+		err      error
+		expected bool
+	}{
+		{
+			desc:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			desc:     "no match",
+			err:      errors.New("no match"),
+			expected: false,
+		},
+		{
+			desc:     "match error message",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 217s, HTTPStatusCode: 0, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"client throttled\""),
+			expected: true,
+		},
+		{
+			desc:     "match error message exceeds 1200s",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 2170s, HTTPStatusCode: 0, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"client throttled\""),
+			expected: true,
+		},
+		{
+			desc:     "match error message with TooManyRequests throttling",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 2170s, HTTPStatusCode: 429, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"TooManyRequests\""),
+			expected: true,
+		},
+	}
+
+	for _, test := range tests {
+		result := isThrottlingError(test.err)
+		if result != test.expected {
+			t.Errorf("desc: (%s), input: err(%v), IsThrottlingError returned with bool(%t), not equal to expected(%t)",
+				test.desc, test.err, result, test.expected)
+		}
+	}
+}
+
+func TestGetBackOff(t *testing.T) {
+	tests := []struct {
+		desc     string
+		config   azureconfig.Config
+		expected wait.Backoff
+	}{
+		{
+			desc: "default backoff",
+			config: azureconfig.Config{
+				AzureClientConfig: azureconfig.AzureClientConfig{
+					CloudProviderBackoffRetries:  0,
+					CloudProviderBackoffDuration: 5,
+				},
+				CloudProviderBackoffExponent: 2,
+				CloudProviderBackoffJitter:   1,
+			},
+			expected: wait.Backoff{
+				Steps:    1,
+				Duration: 5 * time.Second,
+				Factor:   2,
+				Jitter:   1,
+			},
+		},
+		{
+			desc: "backoff with retries > 1",
+			config: azureconfig.Config{
+				AzureClientConfig: azureconfig.AzureClientConfig{
+					CloudProviderBackoffRetries:  3,
+					CloudProviderBackoffDuration: 4,
+				},
+				CloudProviderBackoffExponent: 2,
+				CloudProviderBackoffJitter:   1,
+			},
+			expected: wait.Backoff{
+				Steps:    3,
+				Duration: 4 * time.Second,
+				Factor:   2,
+				Jitter:   1,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		result := getBackOff(test.config)
+		if !reflect.DeepEqual(result, test.expected) {
+			t.Errorf("desc: (%s), input: config(%v), getBackOff returned with backoff(%v), not equal to expected(%v)",
+				test.desc, test.config, result, test.expected)
+		}
+	}
+}
+
+func TestVolumeMounter(t *testing.T) {
+	path := "/mnt/data"
+	attributes := volume.Attributes{}
+
+	mounter := &VolumeMounter{
+		path:       path,
+		attributes: attributes,
+	}
+
+	if mounter.GetPath() != path {
+		t.Errorf("Expected path %s, but got %s", path, mounter.GetPath())
+	}
+
+	if mounter.GetAttributes() != attributes {
+		t.Errorf("Expected attributes %v, but got %v", attributes, mounter.GetAttributes())
+	}
+
+	if err := mounter.CanMount(); err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	if err := mounter.SetUp(volume.MounterArgs{}); err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	if err := mounter.SetUpAt("", volume.MounterArgs{}); err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	metrics, err := mounter.GetMetrics()
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if metrics != nil {
+		t.Errorf("Expected nil metrics, but got %v", metrics)
+	}
+}
+
+func TestGetFileServiceURL(t *testing.T) {
+	tests := []struct {
+		desc                  string
+		account               string
+		storageEndPointSuffix string
+		expected              string
+	}{
+		{
+			desc:                  "default storage endpoint",
+			account:               "testaccount",
+			storageEndPointSuffix: "",
+			expected:              "https://testaccount.file.core.windows.net",
+		},
+		{
+			desc:                  "custom storage endpoint",
+			account:               "testaccount",
+			storageEndPointSuffix: "core.windows.cn",
+			expected:              "https://testaccount.file.core.windows.cn",
+		},
+		{
+			desc:                  "storage endpoint core.windows.net",
+			account:               "testaccount",
+			storageEndPointSuffix: "core.windows.net",
+			expected:              "https://testaccount.file.core.windows.net",
+		},
+	}
+
+	for _, test := range tests {
+		result := getFileServiceURL(test.account, test.storageEndPointSuffix)
+		if result != test.expected {
+			t.Errorf("desc: (%s), input: account(%s), storageEndPointSuffix(%s), getFileServiceURL returned with string(%s), not equal to expected(%s)",
+				test.desc, test.account, test.storageEndPointSuffix, result, test.expected)
+		}
+	}
+}
+
+func TestIsValidSubscriptionID(t *testing.T) {
+	tests := []struct {
+		desc     string
+		subsID   string
+		expected bool
+	}{
+		{
+			desc:     "valid subscription ID",
+			subsID:   "c9d2281e-dcd5-4dfd-9a97-0d50377cdf76",
+			expected: true,
+		},
+		{
+			desc:     "invalid subscription ID - missing sections",
+			subsID:   "123e4567-e89b-12d3-a456",
+			expected: false,
+		},
+		{
+			desc:     "invalid subscription ID - invalid characters",
+			subsID:   "123e4567-e89b-12d3-a456-42661417400z",
+			expected: false,
+		},
+		{
+			desc:     "invalid subscription ID - empty string",
+			subsID:   "",
+			expected: false,
+		},
+		{
+			desc:     "invalid subscription ID - too short",
+			subsID:   "123e4567",
+			expected: false,
+		},
+		{
+			desc:     "invalid subscription ID - too long",
+			subsID:   "123e4567-e89b-12d3-a456-426614174000-extra",
+			expected: false,
+		},
+		{
+			desc:     "invalid subscription ID - timestamp",
+			subsID:   "2025-04-15T11:06:21.0000000Z",
+			expected: false,
+		},
+		{
+			desc:     "valid subscription ID - uppercase letters",
+			subsID:   "C9D2281E-DCD5-4DFD-9A97-0D50377CDF76",
+			expected: true,
+		},
+	}
+
+	for _, test := range tests {
+		result := isValidSubscriptionID(test.subsID)
+		if result != test.expected {
+			t.Errorf("desc: (%s), input: subsID(%s), isValidSubscriptionID returned with bool(%v), not equal to expected(%v)",
+				test.desc, test.subsID, result, test.expected)
+		}
+	}
+}
+
+func TestRemoveOptionIfExists(t *testing.T) {
+	tests := []struct {
+		desc            string
+		options         []string
+		removeOption    string
+		expectedOptions []string
+		expected        bool
+	}{
+		{
+			desc:         "nil options",
+			removeOption: "option",
+			expected:     false,
+		},
+		{
+			desc:            "empty options",
+			options:         []string{},
+			removeOption:    "option",
+			expectedOptions: []string{},
+			expected:        false,
+		},
+		{
+			desc:            "option not found",
+			options:         []string{"option1", "option2"},
+			removeOption:    "option",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        false,
+		},
+		{
+			desc:            "option found in the last element",
+			options:         []string{"option1", "option2", "option"},
+			removeOption:    "option",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        true,
+		},
+		{
+			desc:            "option found in the first element",
+			options:         []string{"option", "option1", "option2"},
+			removeOption:    "option",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        true,
+		},
+		{
+			desc:            "option found in the middle element",
+			options:         []string{"option1", "option", "option2"},
+			removeOption:    "option",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        true,
+		},
+		{
+			desc:            "option found with case insensitive match",
+			options:         []string{"option1", "encryptInTransit", "option2"},
+			removeOption:    "encryptintransit",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        true,
+		},
+	}
+
+	for _, test := range tests {
+		result, exists := removeOptionIfExists(test.options, test.removeOption)
+		if !reflect.DeepEqual(result, test.expectedOptions) {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, result, test.expectedOptions)
+		}
+		if exists != test.expected {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, exists, test.expected)
+		}
+	}
+}
+
+func TestGetDefaultIOPS(t *testing.T) {
+	tests := []struct {
+		desc               string
+		requestGiB         int
+		storageAccountType string
+		expected           *int32
+	}{
+		{
+			desc:               "standardv2 with small storage",
+			requestGiB:         100,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(1020),
+		},
+		{
+			desc:               "standardv2 with 1GiB storage",
+			requestGiB:         1,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(1001),
+		},
+		{
+			desc:               "standardv2 with large storage hitting max",
+			requestGiB:         300000,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(50000),
+		},
+		{
+			desc:               "standardv2 case insensitive",
+			requestGiB:         100,
+			storageAccountType: "STANDARDV2",
+			expected:           int32Ptr(1020),
+		},
+		{
+			desc:               "premiumv2 with small storage",
+			requestGiB:         100,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(3100),
+		},
+		{
+			desc:               "premiumv2 with 1GiB storage",
+			requestGiB:         1,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(3001),
+		},
+		{
+			desc:               "premiumv2 with large storage hitting max",
+			requestGiB:         200000,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(102400),
+		},
+		{
+			desc:               "premiumv2 case insensitive",
+			requestGiB:         100,
+			storageAccountType: "PREMIUMV2",
+			expected:           int32Ptr(3100),
+		},
+		{
+			desc:               "unsupported storage account type",
+			requestGiB:         100,
+			storageAccountType: "Standard_LRS",
+			expected:           nil,
+		},
+		{
+			desc:               "empty storage account type",
+			requestGiB:         100,
+			storageAccountType: "",
+			expected:           nil,
+		},
+		{
+			desc:               "standardv2 with zero storage",
+			requestGiB:         0,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(1000),
+		},
+		{
+			desc:               "premiumv2 with zero storage",
+			requestGiB:         0,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(3000),
+		},
+	}
+
+	for _, test := range tests {
+		result := getDefaultIOPS(test.requestGiB, test.storageAccountType)
+		if test.expected == nil {
+			if result != nil {
+				t.Errorf("test[%s]: unexpected output: %v, expected nil", test.desc, *result)
+			}
+		} else {
+			if result == nil {
+				t.Errorf("test[%s]: unexpected nil output, expected: %v", test.desc, *test.expected)
+			} else if *result != *test.expected {
+				t.Errorf("test[%s]: unexpected output: %v, expected: %v", test.desc, *result, *test.expected)
+			}
+		}
+	}
+}
+
+func TestGetDefaultBandwidth(t *testing.T) {
+	tests := []struct {
+		desc               string
+		requestGiB         int
+		storageAccountType string
+		expected           *int32
+	}{
+		{
+			desc:               "standardv2 with small storage",
+			requestGiB:         100,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(62),
+		},
+		{
+			desc:               "standardv2 with 1GiB storage",
+			requestGiB:         1,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(61),
+		},
+		{
+			desc:               "standardv2 with large storage hitting max",
+			requestGiB:         300000,
+			storageAccountType: "StandardV2_LRS_",
+			expected:           int32Ptr(5120),
+		},
+		{
+			desc:               "standardv2 case insensitive",
+			requestGiB:         100,
+			storageAccountType: "STANDARDV2",
+			expected:           int32Ptr(62),
+		},
+		{
+			desc:               "premiumv2 with small storage",
+			requestGiB:         100,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(110),
+		},
+		{
+			desc:               "premiumv2 with 1GiB storage",
+			requestGiB:         1,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(101),
+		},
+		{
+			desc:               "premiumv2 with large storage hitting max",
+			requestGiB:         200000,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(10340),
+		},
+		{
+			desc:               "premiumv2 case insensitive",
+			requestGiB:         100,
+			storageAccountType: "PREMIUMV2",
+			expected:           int32Ptr(110),
+		},
+		{
+			desc:               "unsupported storage account type",
+			requestGiB:         100,
+			storageAccountType: "Standard_LRS",
+			expected:           nil,
+		},
+		{
+			desc:               "empty storage account type",
+			requestGiB:         100,
+			storageAccountType: "",
+			expected:           nil,
+		},
+		{
+			desc:               "standardv2 with zero storage",
+			requestGiB:         0,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(60),
+		},
+		{
+			desc:               "premiumv2 with zero storage",
+			requestGiB:         0,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(100),
+		},
+		{
+			desc:               "standardv2 with storage for exact calculation",
+			requestGiB:         2500,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(110),
+		},
+		{
+			desc:               "premiumv2 with storage for exact calculation",
+			requestGiB:         1000,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(200),
+		},
+	}
+
+	for _, test := range tests {
+		result := getDefaultBandwidth(test.requestGiB, test.storageAccountType)
+		if test.expected == nil {
+			if result != nil {
+				t.Errorf("test[%s]: unexpected output: %v, expected nil", test.desc, *result)
+			}
+		} else {
+			if result == nil {
+				t.Errorf("test[%s]: unexpected nil output, expected: %v", test.desc, *test.expected)
+			} else if *result != *test.expected {
+				t.Errorf("test[%s]: unexpected output: %v, expected: %v", test.desc, *result, *test.expected)
+			}
+		}
+	}
+}
+
+func TestSetCredentialCache(t *testing.T) {
+	tests := []struct {
+		desc          string
+		server        string
+		clientID      string
+		tenantID      string
+		tokenFile     string
+		expectedError string
+	}{
+		{
+			desc:          "empty server",
+			server:        "",
+			clientID:      "test-client-id",
+			tenantID:      "test-tenant-id",
+			tokenFile:     "test-token-file",
+			expectedError: "server must be provided",
+		},
+		{
+			desc:          "empty clientID",
+			server:        "test.file.core.windows.net",
+			clientID:      "",
+			tenantID:      "test-tenant-id",
+			tokenFile:     "test-token-file",
+			expectedError: "clientID must be provided when tokenFile is set",
+		},
+		{
+			desc:          "empty tenantID with tokenFile",
+			server:        "test.file.core.windows.net",
+			clientID:      "test-client-id",
+			tenantID:      "",
+			tokenFile:     "test-token-file",
+			expectedError: "tenantID must be provided when tokenFile is provided",
+		},
+		{
+			desc:          "valid IMDS authentication (no tokenFile)",
+			server:        "test.file.core.windows.net",
+			clientID:      "test-client-id",
+			tenantID:      "",
+			tokenFile:     "",
+			expectedError: "", // Will fail due to missing azfilesauthmanager, but validates argument construction
+		},
+		{
+			desc:          "valid workload identity authentication",
+			server:        "test.file.core.windows.net",
+			clientID:      "test-client-id",
+			tenantID:      "test-tenant-id",
+			tokenFile:     "test-token-file",
+			expectedError: "", // Will fail due to missing azfilesauthmanager, but validates argument construction
+		},
+		{
+			desc:          "both empty server and clientID",
+			server:        "",
+			clientID:      "",
+			tenantID:      "test-tenant-id",
+			tokenFile:     "test-token-file",
+			expectedError: "server must be provided",
+		},
+	}
+
+	for _, test := range tests {
+		_, err := setCredentialCache(test.server, test.clientID, test.tenantID, test.tokenFile, "", defaultActiveDirectoryEndpoint, defaultStorageResource)
+		if test.expectedError != "" {
+			if err == nil {
+				t.Errorf("test[%s]: expected error containing %q, got nil", test.desc, test.expectedError)
+			} else if !strings.Contains(err.Error(), test.expectedError) {
+				t.Errorf("test[%s]: expected error containing %q, got %v", test.desc, test.expectedError, err)
+			}
+		}
+		// Note: We don't test successful execution as it requires azfilesauthmanager binary
+		// The actual command execution will fail, but we've validated the argument construction
+	}
+
+	// Test direct token mode
+	tokenTests := []struct {
+		desc          string
+		server        string
+		token         string
+		tokenFile     string
+		expectedError string
+	}{
+		{
+			desc:          "token mode: empty server",
+			server:        "",
+			token:         "test-oauth-token",
+			expectedError: "server must be provided",
+		},
+		{
+			desc:          "token mode: valid token bypasses clientID check",
+			server:        "test.file.core.windows.net",
+			token:         "test-oauth-token",
+			expectedError: "", // Will fail due to missing azfilesauthmanager, but must NOT fail with clientID/tenantID error
+		},
+		{
+			desc:          "both token and tokenFile should fail",
+			server:        "test.file.core.windows.net",
+			token:         "test-oauth-token",
+			tokenFile:     "/tmp/token",
+			expectedError: "token and tokenFile are mutually exclusive",
+		},
+	}
+
+	for _, test := range tokenTests {
+		_, err := setCredentialCache(test.server, "", "", test.tokenFile, test.token, "", "")
+		if test.expectedError != "" {
+			if err == nil {
+				t.Errorf("test[%s]: expected error containing %q, got nil", test.desc, test.expectedError)
+			} else if !strings.Contains(err.Error(), test.expectedError) {
+				t.Errorf("test[%s]: expected error containing %q, got %v", test.desc, test.expectedError, err)
+			}
+		} else if err != nil {
+			// Token mode should not return clientID/tenantID validation errors
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "clientID must be provided when tokenFile is set") || strings.Contains(errMsg, "tenantID must be provided") {
+				t.Errorf("test[%s]: token mode should bypass clientID/tenantID validation, got: %v", test.desc, err)
+			}
+			// Other errors (e.g., azfilesauthmanager not found) are expected in test environment
+		}
+	}
+}
+
+func int32Ptr(i int32) *int32 {
+	return &i
+}
+
+func TestIsValidTokenFileName(t *testing.T) {
+	testCases := []struct {
+		name     string
+		fileName string
+		expected bool
+	}{
+		{
+			name:     "valid lowercase",
+			fileName: "token",
+			expected: true,
+		},
+		{
+			name:     "valid uppercase",
+			fileName: "TOKEN",
+			expected: true,
+		},
+		{
+			name:     "valid mixed alphanumeric with hyphen",
+			fileName: "Token-123",
+			expected: true,
+		},
+		{
+			name:     "valid mixed alphanumeric with hyphen#2",
+			fileName: "0ab48765-efce-4799-8a9c-c3e1de2ee42eg",
+			expected: true,
+		},
+		{
+			name:     "empty string",
+			fileName: "",
+			expected: false,
+		},
+		{
+			name:     "contains underscore",
+			fileName: "token_file",
+			expected: false,
+		},
+		{
+			name:     "contains dot",
+			fileName: "token.file",
+			expected: false,
+		},
+		{
+			name:     "contains space",
+			fileName: "token file",
+			expected: false,
+		},
+		{
+			name:     "contains slash",
+			fileName: "token/file",
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isValidTokenFileName(tc.fileName); got != tc.expected {
+				t.Fatalf("isValidTokenFileName(%q) = %t, want %t", tc.fileName, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestIsValidFolderName(t *testing.T) {
+	tests := []struct {
+		name      string
+		folder    string
+		expectErr bool
+	}{
+		{name: "valid simple", folder: "myfolder", expectErr: false},
+		{name: "valid nested", folder: "a/b/c", expectErr: false},
+		{name: "valid with leading slash", folder: "/myfolder", expectErr: false},
+		{name: "valid with trailing slash", folder: "myfolder/", expectErr: false},
+		{name: "valid with pvc placeholder", folder: "${pvc.metadata.name}", expectErr: false},
+		{name: "empty string is allowed", folder: "", expectErr: false},
+		{name: "backslash", folder: "my\\folder", expectErr: true},
+		{name: "colon", folder: "my:folder", expectErr: true},
+		{name: "asterisk", folder: "my*folder", expectErr: true},
+		{name: "question mark", folder: "my?folder", expectErr: true},
+		{name: "double quote", folder: `my"folder`, expectErr: true},
+		{name: "less than", folder: "my<folder", expectErr: true},
+		{name: "greater than", folder: "my>folder", expectErr: true},
+		{name: "pipe", folder: "my|folder", expectErr: true},
+		{name: "control char", folder: "my\x01folder", expectErr: true},
+		{name: "null byte", folder: "my\x00folder", expectErr: true},
+		{name: "whitespace only", folder: "   ", expectErr: true},
+		{name: "whitespace only segment in path", folder: "a/   /b", expectErr: true},
+		{name: "dot dot segment", folder: "..", expectErr: true},
+		{name: "dot dot in path", folder: "a/../b", expectErr: true},
+		{name: "ends with period", folder: "folder.", expectErr: true},
+		{name: "ends with space", folder: "folder ", expectErr: true},
+		{name: "empty segment", folder: "a//b", expectErr: true},
+		{name: "nested segment ends with period", folder: "a/b./c", expectErr: true},
+		{name: "valid hyphen and underscore", folder: "my-folder_name", expectErr: false},
+		{name: "valid dots in middle", folder: "my.folder.name", expectErr: false},
+		{name: "invalid single dot segment", folder: ".", expectErr: true},
+		{name: "reserved name CON is allowed", folder: "CON", expectErr: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := isValidFolderName(tc.folder)
+			if tc.expectErr && err == nil {
+				t.Fatalf("isValidFolderName(%q) expected error but got nil", tc.folder)
+			}
+			if !tc.expectErr && err != nil {
+				t.Fatalf("isValidFolderName(%q) unexpected error: %v", tc.folder, err)
+			}
+		})
+	}
+}
+
+func TestContainsMountOptionDelimiter(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"", false},
+		{"abc123+/=", false},
+		{"validbase64key==", false},
+		{"key,extra", true},
+		{"abc,def", true},
+		{"line1\nline2", true},
+		{"line1\rline2", true},
+		{"has\x00nul", true},
+	}
+	for _, tc := range tests {
+		if got := containsMountOptionDelimiter(tc.input); got != tc.expected {
+			t.Errorf("containsMountOptionDelimiter(%q) = %v, want %v", tc.input, got, tc.expected)
+		}
+	}
+}
+
+func TestValidateSMBCredentialValues(t *testing.T) {
+	tests := []struct {
+		name        string
+		accountName string
+		accountKey  string
+		expectErr   bool
+	}{
+		{"valid empty (identity auth)", "", "", false},
+		{"valid account and base64 key", "myaccount", "ZmFrZS1rZXktdmFsdWU+Pj8/", false},
+		{"comma in key value", "myaccount", "abc,def", true},
+		{"comma in key value alt", "myaccount", "key,extra", true},
+		{"newline in key", "myaccount", "abc\ndef", true},
+		{"carriage return in key", "myaccount", "abc\rdef", true},
+		{"nul in key", "myaccount", "abc\x00def", true},
+		{"comma in account name", "my,account", "validkey", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSMBCredentialValues(tc.accountName, tc.accountKey)
+			if (err != nil) != tc.expectErr {
+				t.Errorf("validateSMBCredentialValues(%q, <key>) error = %v, expectErr %v", tc.accountName, err, tc.expectErr)
+			}
+		})
 	}
 }

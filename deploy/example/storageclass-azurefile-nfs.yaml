@@ -6,6 +6,11 @@ metadata:
 provisioner: file.csi.azure.com
 parameters:
   protocol: nfs
+  skuName: Premium_LRS     # available values: Premium_LRS, Premium_ZRS
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
 allowVolumeExpansion: true
+mountOptions:
+  - nconnect=4
+  - noresvport
+  - actimeo=30

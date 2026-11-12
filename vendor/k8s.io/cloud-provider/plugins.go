@@ -33,19 +33,8 @@ type Factory func(config io.Reader) (Interface, error)
 
 // All registered cloud providers.
 var (
-	providersMutex           sync.Mutex
-	providers                = make(map[string]Factory)
-	deprecatedCloudProviders = []struct {
-		name     string
-		external bool
-		detail   string
-	}{
-		{"aws", false, "The AWS provider is deprecated and will be removed in a future release"},
-		{"azure", false, "The Azure provider is deprecated and will be removed in a future release"},
-		{"gce", false, "The GCE provider is deprecated and will be removed in a future release"},
-		{"openstack", true, "https://github.com/kubernetes/cloud-provider-openstack"},
-		{"vsphere", false, "The vSphere provider is deprecated and will be removed in a future release"},
-	}
+	providersMutex sync.Mutex
+	providers      = make(map[string]Factory)
 )
 
 const externalCloudProvider = "external"
@@ -91,20 +80,19 @@ func IsExternal(name string) bool {
 	return name == externalCloudProvider
 }
 
-func DeprecationWarningForProvider(providerName string) {
-	for _, provider := range deprecatedCloudProviders {
-		if provider.name != providerName {
-			continue
-		}
-
-		detail := provider.detail
-		if provider.external {
-			detail = fmt.Sprintf("Please use 'external' cloud provider for %s: %s", providerName, provider.detail)
-		}
-
-		klog.Warningf("WARNING: %s built-in cloud provider is now deprecated. %s", providerName, detail)
-		break
+// DisableWarningForProvider logs information about disabled cloud provider state
+func DisableWarningForProvider(providerName string) {
+	if !IsExternal(providerName) {
+		klog.Infof("INFO: Please make sure you are running an external cloud controller manager binary for provider %q."+
+			"In-tree cloud providers are disabled. Refer to https://github.com/kubernetes/kubernetes/tree/master/staging/src/k8s.io/cloud-provider/sample "+
+			"for an example implementation.", providerName)
+		klog.Warningf("WARNING: built-in cloud providers are disabled. Please set \"--cloud-provider=external\" and migrate to an external cloud controller manager for provider %q", providerName)
 	}
+}
+
+// ErrorForDisabledProvider returns an error formatted with the supplied provider name
+func ErrorForDisabledProvider(providerName string) error {
+	return fmt.Errorf("cloud provider %q was specified, but built-in cloud providers are disabled. Please set --cloud-provider=external and migrate to an external cloud provider", providerName)
 }
 
 // InitCloudProvider creates an instance of the named cloud provider.

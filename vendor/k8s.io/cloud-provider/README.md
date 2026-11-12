@@ -1,3 +1,8 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # cloud-provider
 
 This repository defines the cloud-provider interface and mechanism to initialize
@@ -30,3 +35,4 @@ later synced here.
  2. Directly modify anything under vendor/k8s.io/cloud-provider in this repo. Those are driven from `k8s.io/kubernetes/staging/src/k8s.io/cloud-provider`.
  3. Make interface changes without first discussing them with
     sig-cloudprovider.
+

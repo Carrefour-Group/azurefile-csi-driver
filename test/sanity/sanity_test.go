@@ -46,7 +46,7 @@ func TestSanity(t *testing.T) {
 	os.Setenv("AZURE_CREDENTIAL_FILE", credentials.TempAzureCredentialFilePath)
 	os.Setenv("nodeid", nodeid)
 
-	azureClient, err := azure.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret)
+	azureClient, err := azure.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret, creds.AADFederatedTokenFile)
 	assert.NoError(t, err)
 
 	ctx := context.Background()
@@ -58,14 +58,10 @@ func TestSanity(t *testing.T) {
 		// Only delete resource group the test created
 		if strings.HasPrefix(creds.ResourceGroup, credentials.ResourceGroupPrefix) {
 			log.Printf("Deleting resource group %s", creds.ResourceGroup)
-			err := azureClient.DeleteResourceGroup(ctx, creds.ResourceGroup, false)
-			assert.NoError(t, err)
+			err := azureClient.DeleteResourceGroup(ctx, creds.ResourceGroup)
+			log.Printf("Deleted resource group %s failed with error %v", creds.ResourceGroup, err)
 		}
 	}()
-
-	log.Printf("Creating a VM in %s", creds.ResourceGroup)
-	_, err = azureClient.EnsureVirtualMachine(ctx, creds.ResourceGroup, creds.Location, nodeid)
-	assert.NoError(t, err)
 
 	// Execute the script from project root
 	err = os.Chdir("../..")

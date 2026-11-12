@@ -19,6 +19,9 @@ spec:
       nodeSelector:
         kubernetes.io/os: linux  # add "kubernetes.io/role: master" to run controller on master node
       priorityClassName: system-cluster-critical
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       tolerations:
         - key: "node-role.kubernetes.io/master"
           operator: "Exists"
@@ -26,15 +29,26 @@ spec:
         - key: "node-role.kubernetes.io/controlplane"
           operator: "Exists"
           effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "CriticalAddonsOnly"
+          operator: "Exists"
+          effect: "NoSchedule"
       containers:
         - name: csi-provisioner
-          image: mcr.microsoft.com/oss/kubernetes-csi/csi-provisioner:v2.2.2
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/csi-provisioner:v6.4.0
           args:
             - "-v=2"
             - "--csi-address=$(ADDRESS)"
             - "--leader-election"
-            - "--timeout=300s"
+            - "--leader-election-namespace=kube-system"
+            - "--timeout=1200s"
             - "--extra-create-metadata=true"
+            - "--kube-api-qps=50"
+            - "--kube-api-burst=100"
+            - "--retry-interval-max=30m"
+            - "--feature-gates=VolumeAttributesClass=false"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -43,57 +57,51 @@ spec:
               name: socket-dir
           resources:
             limits:
-              cpu: 100m
-              memory: 300Mi
+              memory: 500Mi
             requests:
               cpu: 10m
               memory: 20Mi
-        - name: csi-attacher
-          image: mcr.microsoft.com/oss/kubernetes-csi/csi-attacher:v3.3.0
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+        - name: csi-snapshotter
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/csi-snapshotter:v8.7.0
           args:
             - "-v=2"
             - "-csi-address=$(ADDRESS)"
-            - "-timeout=120s"
-            - "-leader-election"
+            - "--leader-election"
+            - "--leader-election-namespace=kube-system"
+            - "--kube-api-qps=100"
+            - "--kube-api-burst=200"
+            - "--retry-interval-max=30m"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
           volumeMounts:
-            - mountPath: /csi
-              name: socket-dir
+            - name: socket-dir
+              mountPath: /csi
           resources:
             limits:
-              cpu: 100m
               memory: 200Mi
             requests:
               cpu: 10m
               memory: 20Mi
-        - name: csi-snapshotter
-          image: mcr.microsoft.com/oss/kubernetes-csi/csi-snapshotter:v3.0.3
-          args:
-            - "-v=2"
-            - "-csi-address=$(ADDRESS)"
-            - "-leader-election"
-          env:
-            - name: ADDRESS
-              value: /csi/csi.sock
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /csi
-          resources:
-            limits:
-              cpu: 100m
-              memory: 100Mi
-            requests:
-              cpu: 10m
-              memory: 20Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
         - name: csi-resizer
-          image: mcr.microsoft.com/oss/kubernetes-csi/csi-resizer:v1.3.0
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/csi-resizer:v2.3.0
           args:
             - "-csi-address=$(ADDRESS)"
             - "-v=2"
-            - "-leader-election"
+            - "--leader-election"
+            - "--leader-election-namespace=kube-system"
             - '-handle-volume-inuse-error=false'
+            - '-feature-gates=VolumeAttributesClass=false'
+            - '-timeout=120s'
+            - "--retry-interval-max=30m"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -102,28 +110,34 @@ spec:
               mountPath: /csi
           resources:
             limits:
-              cpu: 100m
-              memory: 300Mi
+              memory: 500Mi
             requests:
               cpu: 10m
               memory: 20Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
         - name: liveness-probe
-          image: mcr.microsoft.com/oss/kubernetes-csi/livenessprobe:v2.4.0
+          image: mcr.microsoft.com/oss/v2/kubernetes-csi/livenessprobe:v2.20.0
           args:
             - --csi-address=/csi/csi.sock
             - --probe-timeout=3s
-            - --health-port=29612
+            - --http-endpoint=localhost:29612
             - --v=2
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
           resources:
             limits:
-              cpu: 100m
               memory: 100Mi
             requests:
               cpu: 10m
               memory: 20Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
         - name: azurefile
           image: mcr.microsoft.com/k8s/csi/azurefile-csi:latest
           imagePullPolicy: IfNotPresent
@@ -133,17 +147,15 @@ spec:
             - "--metrics-address=0.0.0.0:29614"
             - "--user-agent-suffix=OSS-kubectl"
           ports:
-            - containerPort: 29612
-              name: healthz
-              protocol: TCP
             - containerPort: 29614
               name: metrics
               protocol: TCP
           livenessProbe:
             failureThreshold: 5
             httpGet:
+              host: localhost
               path: /healthz
-              port: healthz
+              port: 29612
             initialDelaySeconds: 30
             timeoutSeconds: 10
             periodSeconds: 30
@@ -156,28 +168,36 @@ spec:
                   optional: true
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
+            - name: AZCOPY_CONCURRENCY_VALUE
+              value: "10"
+            - name: AZCOPY_CONCURRENT_FILES
+              value: "20"
+            - name: AZCOPY_BUFFER_GB
+              value: "1"
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
+            - mountPath: /root/.azcopy
+              name: azcopy-dir
             - mountPath: /etc/kubernetes/
               name: azure-cred
-            - mountPath: /var/lib/waagent/ManagedIdentity-Settings
               readOnly: true
-              name: msi
           resources:
             limits:
-              cpu: 200m
-              memory: 200Mi
+              memory: 800Mi
             requests:
               cpu: 10m
               memory: 20Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
       volumes:
         - name: socket-dir
+          emptyDir: {}
+        - name: azcopy-dir
           emptyDir: {}
         - name: azure-cred
           hostPath:
             path: /etc/kubernetes/
-            type: Directory
-        - name: msi
-          hostPath:
-            path: /var/lib/waagent/ManagedIdentity-Settings
+            type: DirectoryOrCreate

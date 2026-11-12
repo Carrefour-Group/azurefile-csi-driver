@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Copyright 2020 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/bin/bash
-
 # set -e
 
 NS=kube-system
@@ -23,8 +23,15 @@ if [[ "$#" -gt 0 ]]; then
     DRIVER=$1
 fi
 
+cleanup() {
+    echo "hit unexpected error during log print, exit 0"
+    exit 0
+}
+
+trap cleanup ERR
+
 echo "print out all nodes status ..."
-kubectl get nodes -o wide
+kubectl get nodes -o wide --show-labels
 echo "======================================================================================"
 
 echo "print out all default namespace pods status ..."
@@ -63,7 +70,12 @@ kubectl get pods -n${NS} -l${LABEL} \
     | awk 'NR>1 {print $1}' \
     | xargs -I {} bash -c "echo 'dumping logs for ${NS}/{}/${DRIVER}' && kubectl logs {} -c${CONTAINER} -n${NS}"
 
-echo "print out cloudprovider_azure metrics ..."
 echo "======================================================================================"
 ip=`kubectl get svc csi-${DRIVER}-controller -n kube-system | awk '{print $4}'`
-curl http://$ip:29614/metrics
+if echo "$ip" | grep -q "\."; then
+    echo "print out cloudprovider_azure metrics ..."
+    curl http://$ip:29614/metrics
+else
+    echo "csi-$DRIVER-controller service ip is empty"
+    kubectl get svc csi-$DRIVER-controller -n kube-system
+fi

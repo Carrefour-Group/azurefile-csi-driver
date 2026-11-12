@@ -14,5 +14,12 @@ DriverInfo:
     topology: false
     controllerExpansion: true
     nodeExpansion: true
+    offlineExpansion: true
+    onlineExpansion: true
     volumeLimits: false
     snapshotDataSource: true
+    volumeMountGroup: true
+    pvcDataSource: true
+  StressTestOptions:
+    NumPods: 10
+    NumRestarts: 10

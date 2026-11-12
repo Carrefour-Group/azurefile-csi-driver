@@ -33,6 +33,12 @@ const IsNegativeErrorMsg string = `must be greater than or equal to 0`
 // value that were not valid.  Otherwise this returns an empty list or nil.
 type ValidateNameFunc func(name string, prefix bool) []string
 
+// ValidateNameFuncWithErrors validates that the provided name is valid for a
+// given resource type.
+//
+// This is similar to ValidateNameFunc, except that it produces an ErrorList.
+type ValidateNameFuncWithErrors func(fldPath *field.Path, name string) field.ErrorList
+
 // NameIsDNSSubdomain is a ValidateNameFunc for names that must be a DNS subdomain.
 func NameIsDNSSubdomain(name string, prefix bool) []string {
 	if prefix {
@@ -68,9 +74,11 @@ var ValidateNamespaceName = NameIsDNSLabel
 var ValidateServiceAccountName = NameIsDNSSubdomain
 
 // maskTrailingDash replaces the final character of a string with a subdomain safe
-// value if is a dash.
+// value if it is a dash and if the length of this string is greater than 1. Note that
+// this is used when a value could be appended to the string, see ValidateNameFunc
+// for more info.
 func maskTrailingDash(name string) string {
-	if strings.HasSuffix(name, "-") {
+	if len(name) > 1 && strings.HasSuffix(name, "-") {
 		return name[:len(name)-2] + "a"
 	}
 	return name
@@ -80,7 +88,7 @@ func maskTrailingDash(name string) string {
 func ValidateNonnegativeField(value int64, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 	if value < 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath, value, IsNegativeErrorMsg))
+		allErrs = append(allErrs, field.Invalid(fldPath, value, IsNegativeErrorMsg).WithOrigin("minimum"))
 	}
 	return allErrs
 }

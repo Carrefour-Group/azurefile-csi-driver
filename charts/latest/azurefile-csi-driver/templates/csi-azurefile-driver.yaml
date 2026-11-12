@@ -3,19 +3,21 @@ apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
   name: {{ .Values.driver.name }}
+  labels:
+    {{- include "azurefile.labels" . | nindent 4 }}
   annotations:
     csiDriver: "{{ .Values.image.azurefile.tag }}"
-{{- if eq .Values.snapshot.apiVersion "beta" }}
     snapshot: "{{ .Values.snapshot.image.csiSnapshotter.tag }}"
-{{- else }}
-    snapshot: "{{ .Values.snapshot.image.csiSnapshotter.gaTag }}"
-{{- end }}
 spec:
   attachRequired: {{ .Values.controller.attachRequired }}
   podInfoOnMount: true
+  requiresRepublish: {{ if hasKey .Values.feature "requiresRepublish" }}{{ .Values.feature.requiresRepublish }}{{ else }}true{{ end }}
   volumeLifecycleModes:
     - Persistent
     - Ephemeral
-  {{- if .Values.feature.enableFSGroupPolicy}}
-  fsGroupPolicy: File
-  {{- end}}
+  fsGroupPolicy: {{ .Values.feature.fsGroupPolicy }}
+  {{- if .Values.feature.serviceAccountTokenInSecrets }}
+  serviceAccountTokenInSecrets: true
+  {{- end }}
+  tokenRequests:
+    - audience: api://AzureADTokenExchange

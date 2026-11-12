@@ -30,6 +30,7 @@ spec:
           volumeMounts:
             - name: persistent-storage
               mountPath: /mnt/azurefile
+              readOnly: false
   updateStrategy:
     type: RollingUpdate
   selector:
@@ -38,9 +39,8 @@ spec:
   volumeClaimTemplates:
     - metadata:
         name: persistent-storage
-        annotations:
-          volume.beta.kubernetes.io/storage-class: azurefile-csi
       spec:
+        storageClassName: azurefile-csi
         accessModes: ["ReadWriteMany"]
         resources:
           requests:

@@ -3,25 +3,72 @@ apiVersion: apps/v1
 metadata:
   name: {{ .Values.controller.name }}
   namespace: {{ .Release.Namespace }}
-{{ include "azurefile.labels" . | indent 2 }}
+  labels:
+    app: {{ .Values.controller.name }}
+    {{- include "azurefile.labels" . | nindent 4 }}
+{{- with .Values.controller.labels }}
+{{ . | toYaml | indent 4 }}
+{{- end }}
+{{- with .Values.controller.annotations }}
+  annotations:
+{{ . | toYaml | indent 4 }}
+{{- end }}
 spec:
   replicas: {{ .Values.controller.replicas }}
   selector:
     matchLabels:
+      {{- include "azurefile.selectorLabels" . | nindent 6 }}
       app: {{ .Values.controller.name }}
+  strategy:
+    type: {{ .Values.controller.strategyType }}
   template:
     metadata:
-{{ include "azurefile.labels" . | indent 6 }}
+      labels:
+        {{- include "azurefile.labels" . | nindent 8 }}
         app: {{ .Values.controller.name }}
+        {{- if .Values.workloadIdentity.clientID }}
+        azure.workload.identity/use: "true"
+        {{- end }}
+{{- with .Values.controller.podLabels }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- with .Values.controller.podAnnotations }}
+      annotations:
+{{ toYaml . | indent 8 }}
+{{- end }}
     spec:
       hostNetwork: {{ .Values.controller.hostNetwork }}
       serviceAccountName: {{ .Values.serviceAccount.controller }}
       nodeSelector:
         kubernetes.io/os: linux
-        {{- if .Values.controller.runOnMaster}}
-        kubernetes.io/role: master
-        {{- end}}
+{{- with .Values.controller.nodeSelector }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+    # runOnControlPlane=true or runOnMaster=true only takes effect if affinity is not set
+    {{- if tpl "{{ .Values.controller.affinity }}" . | contains "nodeSelectorTerms" }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+{{ toYaml . | indent 8 }}
+      {{- end }}
+    {{- else if or .Values.controller.runOnControlPlane .Values.controller.runOnMaster}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                {{- if .Values.controller.runOnControlPlane}}
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                {{- end}}
+                {{- if .Values.controller.runOnMaster}}
+                - key: node-role.kubernetes.io/master
+                  operator: Exists
+                {{- end}}
+    {{- end }}
       priorityClassName: system-cluster-critical
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
 {{- with .Values.controller.tolerations }}
       tolerations:
 {{ toYaml . | indent 8 }}
@@ -41,8 +88,13 @@ spec:
             - "-v=2"
             - "--csi-address=$(ADDRESS)"
             - "--leader-election"
-            - "--timeout=300s"
+            - "--leader-election-namespace={{ .Release.Namespace }}"
+            - "--timeout=1200s"
             - "--extra-create-metadata=true"
+            - "--kube-api-qps=50"
+            - "--kube-api-burst=100"
+            - "--retry-interval-max=30m"
+            - "--feature-gates=VolumeAttributesClass=true"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -50,69 +102,36 @@ spec:
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
-          resources:
-            limits:
-              cpu: 100m
-              memory: 300Mi
-            requests:
-              cpu: 10m
-              memory: 20Mi
-        - name: csi-attacher
-{{- if hasPrefix "/" .Values.image.csiAttacher.repository }}
-          image: "{{ .Values.image.baseRepo }}{{ .Values.image.csiAttacher.repository }}:{{ .Values.image.csiAttacher.tag }}"
-{{- else }}
-          image: "{{ .Values.image.csiAttacher.repository }}:{{ .Values.image.csiAttacher.tag }}"
-{{- end }}
-          args:
-            - "-v=2"
-            - "-csi-address=$(ADDRESS)"
-            - "-timeout=120s"
-            - "-leader-election"
-          env:
-            - name: ADDRESS
-              value: /csi/csi.sock
-          imagePullPolicy: {{ .Values.image.csiAttacher.pullPolicy }}
-          volumeMounts:
-          - mountPath: /csi
-            name: socket-dir
-          resources:
-            limits:
-              cpu: 100m
-              memory: 200Mi
-            requests:
-              cpu: 10m
-              memory: 20Mi
+          resources: {{- toYaml .Values.controller.resources.csiProvisioner | nindent 12 }}
+          securityContext:
+            capabilities:
+              drop:
+              - ALL
         - name: csi-snapshotter
-{{- if eq .Values.snapshot.apiVersion "beta" }}
-  {{- if hasPrefix "/" .Values.snapshot.image.csiSnapshotter.repository }}
+{{- if hasPrefix "/" .Values.snapshot.image.csiSnapshotter.repository }}
           image: "{{ .Values.image.baseRepo }}{{ .Values.snapshot.image.csiSnapshotter.repository }}:{{ .Values.snapshot.image.csiSnapshotter.tag }}"
-  {{- else }}
-          image: "{{ .Values.snapshot.image.csiSnapshotter.repository }}:{{ .Values.snapshot.image.csiSnapshotter.tag }}"
-  {{- end }}
 {{- else }}
-  {{- if hasPrefix "/" .Values.snapshot.image.csiSnapshotter.repository }}
-          image: "{{ .Values.image.baseRepo }}{{ .Values.snapshot.image.csiSnapshotter.repository }}:{{ .Values.snapshot.image.csiSnapshotter.gaTag }}"
-  {{- else }}
-          image: "{{ .Values.snapshot.image.csiSnapshotter.repository }}:{{ .Values.snapshot.image.csiSnapshotter.gaTag }}"
-  {{- end }}
+          image: "{{ .Values.snapshot.image.csiSnapshotter.repository }}:{{ .Values.snapshot.image.csiSnapshotter.tag }}"
 {{- end }}
           args:
             - "-csi-address=$(ADDRESS)"
             - "-leader-election"
+            - "--leader-election-namespace={{ .Release.Namespace }}"
             - "-v=2"
+            - "--kube-api-qps=100"
+            - "--kube-api-burst=200"
+            - "--retry-interval-max=30m"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
-          resources:
-            limits:
-              cpu: 100m
-              memory: 100Mi
-            requests:
-              cpu: 10m
-              memory: 20Mi
+          resources: {{- toYaml .Values.controller.resources.csiSnapshotter | nindent 12 }}
+          securityContext:
+            capabilities:
+              drop:
+              - ALL
         - name: csi-resizer
 {{- if hasPrefix "/" .Values.image.csiResizer.repository }}
           image: "{{ .Values.image.baseRepo }}{{ .Values.image.csiResizer.repository }}:{{ .Values.image.csiResizer.tag }}"
@@ -123,7 +142,11 @@ spec:
             - "-csi-address=$(ADDRESS)"
             - "-v=2"
             - "-leader-election"
+            - "--leader-election-namespace={{ .Release.Namespace }}"
             - '-handle-volume-inuse-error=false'
+            - '-timeout=120s'
+            - '-feature-gates=VolumeAttributesClass=true'
+            - "--retry-interval-max=30m"
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -131,13 +154,11 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
-          resources:
-            limits:
-              cpu: 100m
-              memory: 300Mi
-            requests:
-              cpu: 10m
-              memory: 20Mi
+          resources: {{- toYaml .Values.controller.resources.csiResizer | nindent 12 }}
+          securityContext:
+            capabilities:
+              drop:
+              - ALL
         - name: liveness-probe
 {{- if hasPrefix "/" .Values.image.livenessProbe.repository }}
           image: "{{ .Values.image.baseRepo }}{{ .Values.image.livenessProbe.repository }}:{{ .Values.image.livenessProbe.tag }}"
@@ -147,19 +168,21 @@ spec:
           args:
             - --csi-address=/csi/csi.sock
             - --probe-timeout=3s
+{{- if eq .Values.controller.hostNetwork true }}
+            - --http-endpoint=localhost:{{ .Values.controller.livenessProbe.healthPort }}
+{{- else }}
             - --health-port={{ .Values.controller.livenessProbe.healthPort }}
+{{- end }}
             - --v=2
           imagePullPolicy: {{ .Values.image.livenessProbe.pullPolicy }}
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
-          resources:
-            limits:
-              cpu: 100m
-              memory: 100Mi
-            requests:
-              cpu: 10m
-              memory: 20Mi
+          resources: {{- toYaml .Values.controller.resources.livenessProbe | nindent 12 }}
+          securityContext:
+            capabilities:
+              drop:
+              - ALL
         - name: azurefile
 {{- if hasPrefix "/" .Values.image.azurefile.repository }}
           image: "{{ .Values.image.baseRepo }}{{ .Values.image.azurefile.repository }}:{{ .Values.image.azurefile.tag }}"
@@ -176,18 +199,26 @@ spec:
             - "--cloud-config-secret-namespace={{ .Values.controller.cloudConfigSecretNamespace }}"
             - "--custom-user-agent={{ .Values.driver.customUserAgent }}"
             - "--user-agent-suffix={{ .Values.driver.userAgentSuffix }}"
+            - "--allow-empty-cloud-config={{ .Values.controller.allowEmptyCloudConfig }}"
           ports:
-            - containerPort: {{ .Values.controller.livenessProbe.healthPort }}
-              name: healthz
-              protocol: TCP
             - containerPort: {{ .Values.controller.metricsPort }}
               name: metrics
               protocol: TCP
+{{- if ne .Values.controller.hostNetwork true }}
+            - containerPort: {{ .Values.controller.livenessProbe.healthPort }}
+              name: healthz
+              protocol: TCP
+{{- end }}
           livenessProbe:
             failureThreshold: 5
             httpGet:
               path: /healthz
+{{- if eq .Values.controller.hostNetwork true }}
+              host: localhost
+              port: {{ .Values.controller.livenessProbe.healthPort }}
+{{- else }}
               port: healthz
+{{- end }}
             initialDelaySeconds: 30
             timeoutSeconds: 10
             periodSeconds: 30
@@ -195,20 +226,36 @@ spec:
             - name: AZURE_CREDENTIAL_FILE
               valueFrom:
                 configMapKeyRef:
-                  name: azure-cred-file
+                  name: {{ .Values.azureCredentialFileConfigMap }}
                   key: path
                   optional: true
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
+            {{- if ne .Values.driver.httpsProxy "" }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.driver.httpsProxy }}
+            {{- end }}
+            {{- if ne .Values.driver.httpProxy "" }}
+            - name: HTTP_PROXY
+              value: {{ .Values.driver.httpProxy }}
+            {{- end }}
+            - name: AZURE_GO_SDK_LOG_LEVEL
+              value: {{ .Values.driver.azureGoSDKLogLevel }}
+            - name: AZCOPY_CONCURRENCY_VALUE
+              value: "10"
+            - name: AZCOPY_CONCURRENT_FILES
+              value: "20"
+            - name: AZCOPY_BUFFER_GB
+              value: "1"
           imagePullPolicy: {{ .Values.image.azurefile.pullPolicy }}
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
+            - mountPath: /root/.azcopy
+              name: azcopy-dir
             - mountPath: /etc/kubernetes/
               name: azure-cred
-            - mountPath: /var/lib/waagent/ManagedIdentity-Settings
               readOnly: true
-              name: msi
             {{- if eq .Values.linux.distro "fedora" }}
             - name: ssl
               mountPath: /etc/ssl/certs
@@ -217,23 +264,20 @@ spec:
               mountPath: /etc/pki/ca-trust/extracted
               readOnly: true
             {{- end }}
-          resources:
-            limits:
-              cpu: 200m
-              memory: 200Mi
-            requests:
-              cpu: 10m
-              memory: 20Mi
+          resources: {{- toYaml .Values.controller.resources.azurefile | nindent 12 }}
+          securityContext:
+            capabilities:
+              drop:
+              - ALL
       volumes:
         - name: socket-dir
+          emptyDir: {}
+        - name: azcopy-dir
           emptyDir: {}
         - name: azure-cred
           hostPath:
             path: /etc/kubernetes/
-            type: Directory
-        - name: msi
-          hostPath:
-            path: /var/lib/waagent/ManagedIdentity-Settings
+            type: DirectoryOrCreate
         {{- if eq .Values.linux.distro "fedora" }}
         - name: ssl
           hostPath:

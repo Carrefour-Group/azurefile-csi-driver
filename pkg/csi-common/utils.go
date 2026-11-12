@@ -17,7 +17,11 @@ limitations under the License.
 package csicommon
 
 import (
+	"encoding/json"
 	"fmt"
+	"net"
+	"os"
+	"runtime"
 	"strings"
 
 	"golang.org/x/net/context"
@@ -38,70 +42,53 @@ func ParseEndpoint(ep string) (string, string, error) {
 	return "", "", fmt.Errorf("Invalid endpoint: %v", ep)
 }
 
+func ListenEndpoint(ctx context.Context, endpoint string) (net.Listener, error) {
+	proto, addr, err := ParseEndpoint(endpoint)
+	if err != nil {
+		klog.Errorf("%v", err)
+		return nil, err
+	}
+
+	if proto == "unix" {
+		if runtime.GOOS != "windows" {
+			addr = "/" + addr
+		}
+		if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
+			klog.Errorf("Failed to remove %s, error: %v", addr, err)
+			return nil, err
+		}
+	}
+	listenConfig := net.ListenConfig{}
+	listener, err := listenConfig.Listen(ctx, proto, addr)
+	if err != nil {
+		klog.Errorf("Failed to listen: %v", err)
+		return nil, err
+	}
+	return listener, err
+}
+
 func NewVolumeCapabilityAccessMode(mode csi.VolumeCapability_AccessMode_Mode) *csi.VolumeCapability_AccessMode {
 	return &csi.VolumeCapability_AccessMode{Mode: mode}
 }
 
-func NewDefaultNodeServer(d *CSIDriver) *DefaultNodeServer {
-	return &DefaultNodeServer{
-		Driver: d,
-	}
-}
-
-func NewDefaultIdentityServer(d *CSIDriver) *DefaultIdentityServer {
-	return &DefaultIdentityServer{
-		Driver: d,
-	}
-}
-
-func NewDefaultControllerServer(d *CSIDriver) *DefaultControllerServer {
-	return &DefaultControllerServer{
-		Driver: d,
-	}
-}
-
-func NewControllerServiceCapability(cap csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
+func NewControllerServiceCapability(c csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
 	return &csi.ControllerServiceCapability{
 		Type: &csi.ControllerServiceCapability_Rpc{
 			Rpc: &csi.ControllerServiceCapability_RPC{
-				Type: cap,
+				Type: c,
 			},
 		},
 	}
 }
 
-func NewNodeServiceCapability(cap csi.NodeServiceCapability_RPC_Type) *csi.NodeServiceCapability {
+func NewNodeServiceCapability(c csi.NodeServiceCapability_RPC_Type) *csi.NodeServiceCapability {
 	return &csi.NodeServiceCapability{
 		Type: &csi.NodeServiceCapability_Rpc{
 			Rpc: &csi.NodeServiceCapability_RPC{
-				Type: cap,
+				Type: c,
 			},
 		},
 	}
-}
-
-func RunNodePublishServer(endpoint string, d *CSIDriver, ns csi.NodeServer, testMode bool) {
-	ids := NewDefaultIdentityServer(d)
-
-	s := NewNonBlockingGRPCServer()
-	s.Start(endpoint, ids, nil, ns, testMode)
-	s.Wait()
-}
-
-func RunControllerPublishServer(endpoint string, d *CSIDriver, cs csi.ControllerServer, testMode bool) {
-	ids := NewDefaultIdentityServer(d)
-
-	s := NewNonBlockingGRPCServer()
-	s.Start(endpoint, ids, cs, nil, testMode)
-	s.Wait()
-}
-
-func RunControllerandNodePublishServer(endpoint string, d *CSIDriver, cs csi.ControllerServer, ns csi.NodeServer, testMode bool) {
-	ids := NewDefaultIdentityServer(d)
-
-	s := NewNonBlockingGRPCServer()
-	s.Start(endpoint, ids, cs, ns, testMode)
-	s.Wait()
 }
 
 func getLogLevel(method string) int32 {
@@ -113,16 +100,72 @@ func getLogLevel(method string) int32 {
 	return 2
 }
 
-func logGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+func LogGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	level := klog.Level(getLogLevel(info.FullMethod))
 	klog.V(level).Infof("GRPC call: %s", info.FullMethod)
-	klog.V(level).Infof("GRPC request: %s", protosanitizer.StripSecrets(req))
+	klog.V(level).Infof("GRPC request: %s", StripSensitiveValue(protosanitizer.StripSecrets(req), "csi.storage.k8s.io/serviceAccount.tokens"))
 
 	resp, err := handler(ctx, req)
 	if err != nil {
 		klog.Errorf("GRPC error: %v", err)
-	} else {
-		klog.V(level).Infof("GRPC response: %s", protosanitizer.StripSecrets(resp))
+	} else if klog.V(level).Enabled() {
+		// Only serialize once we know V(level) is enabled so that
+		// protosanitizer's lazy formatting is preserved for disabled levels
+		// (e.g. probe/NodeGetCapabilities at V(6) in production).
+		// Empty response bodies carry zero diagnostic value but dominate node
+		// logs (kubelet reconciles NodePublishVolume/NodeUnpublishVolume on
+		// every sync loop, all of which return "{}" on success). Demote to V(6).
+		respStr := protosanitizer.StripSecrets(resp).String()
+		respLevel := level
+		if respStr == "{}" {
+			respLevel = klog.Level(6)
+		}
+		klog.V(respLevel).Infof("GRPC response: %s", respStr)
 	}
 	return resp, err
+}
+
+type stripSensitiveValue struct {
+	// volume_context[key] is the value to be stripped.
+	key string
+	// req is the csi grpc request stripped by `protosanitizer.StripSecrets`
+	req fmt.Stringer
+}
+
+func StripSensitiveValue(req fmt.Stringer, key string) fmt.Stringer {
+	return &stripSensitiveValue{
+		key: key,
+		req: req,
+	}
+}
+
+func (s *stripSensitiveValue) String() string {
+	return stripSensitiveValueByKey(s.req, s.key)
+}
+
+func stripSensitiveValueByKey(req fmt.Stringer, key string) string {
+	var parsed map[string]interface{}
+
+	err := json.Unmarshal([]byte(req.String()), &parsed)
+	if err != nil || parsed == nil {
+		return req.String()
+	}
+
+	volumeContext, ok := parsed["volume_context"].(map[string]interface{})
+	if !ok {
+		return req.String()
+	}
+
+	if _, ok := volumeContext[key]; !ok {
+		return req.String()
+	}
+
+	volumeContext[key] = "***stripped***"
+
+	b, err := json.Marshal(parsed)
+	if err != nil {
+		return req.String()
+	}
+
+	return string(b)
 }

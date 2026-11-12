@@ -12,13 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM k8s.gcr.io/build-image/debian-base:bullseye-v1.0.0
-
 ARG ARCH=amd64
-COPY ./_output/${ARCH}/azurefileplugin /azurefileplugin
+ARG BUILDPLATFORM=linux/amd64
+ARG BASE_IMAGE=registry.k8s.io/build-image/debian-base:bookworm-v1.0.8
 
-RUN apt update && apt-mark unhold libcap2
-RUN clean-install ca-certificates cifs-utils util-linux e2fsprogs mount udev xfsprogs nfs-common libssl1.1
+FROM ${BASE_IMAGE} AS base
+
+FROM --platform=$BUILDPLATFORM ${BASE_IMAGE} AS builder
+
+ARG TARGETARCH=amd64
+
+RUN apt update \
+    && apt install -y curl \
+    && curl -Lso /tmp/packages-microsoft-prod-22.04.deb https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb \
+    && curl -Ls https://github.com/Azure/azure-storage-azcopy/releases/download/v10.34.1/azcopy_linux_${TARGETARCH}_10.34.1.tar.gz \
+        | tar xvzf - --strip-components=1 -C /usr/local/bin/ --wildcards "*/azcopy"
+
+FROM base
+
+ARG ARCH
+ARG binary=./_output/${ARCH}/azurefileplugin
+
+COPY ${binary} /azurefileplugin
+COPY --from=builder --chown=root:root /usr/local/bin/azcopy /usr/local/bin/azcopy
+
+RUN apt update && apt upgrade -y && apt-mark unhold libcap2 && clean-install ca-certificates cifs-utils util-linux e2fsprogs mount udev xfsprogs nfs-common netbase
+
+COPY ./pkg/azurefile-proxy/*.sh /azurefile-proxy/
+COPY ./pkg/azurefile-proxy/azurefile-proxy.service /azurefile-proxy/
+COPY ./_output/${ARCH}/azurefile-proxy /azurefile-proxy/
+
+RUN chmod +x /azurefile-proxy/*.sh && \
+  chmod +x /azurefile-proxy/azurefile-proxy.service && \
+  chmod +x /azurefile-proxy/azurefile-proxy
+
+COPY --from=builder --chown=root:root /tmp/packages-microsoft-prod-22.04.deb /azurefile-proxy/packages-microsoft-prod-22.04.deb
+RUN dpkg -i /azurefile-proxy/packages-microsoft-prod-22.04.deb && apt update && apt install -y azfilesauth=1.0-12 && rm -f /azurefile-proxy/packages-microsoft-prod-22.04.deb
 
 LABEL maintainers="andyzhangx"
 LABEL description="AzureFile CSI Driver"
